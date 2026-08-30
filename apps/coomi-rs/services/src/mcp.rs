@@ -242,6 +242,29 @@ impl McpRuntime {
             fresh.statuses.into_inner().unwrap_or_default();
     }
 
+    /// Compact inventory for ask-mode prompts: names and status only, no tool schemas.
+    pub fn compact_inventory(&self) -> String {
+        let statuses = self.statuses.read().expect("MCP status lock poisoned");
+        if statuses.is_empty() {
+            return String::new();
+        }
+        let mut out = String::from("Configured MCP servers:\n");
+        for status in statuses.iter() {
+            let state = if !status.enabled {
+                "disabled".to_string()
+            } else if let Some(error) = &status.error {
+                format!("connect error: {error}")
+            } else {
+                "enabled".to_string()
+            };
+            out.push_str(&format!(
+                "- {} ({}): {}\n",
+                status.name, status.transport, state
+            ));
+        }
+        out
+    }
+
     /// 已配置 MCP server 清单（含每个 server 的可调用工具名），供系统提示注入：
     /// agent 需要知道「装了哪些 MCP、能不能用、能调哪些工具」才能方便地调用。
     /// 连接失败的 server 也列出（带错误原因），避免 agent 以为它不存在。

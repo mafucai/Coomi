@@ -32,7 +32,7 @@ export interface UsageUpdateEvent {
   event_type: 'usage_update'
   usage: UsageInfo
   reasoning_efforts?: Partial<Record<'auto' | 'low' | 'medium' | 'high' | 'xhigh', ReasoningEffortStats>>
-  context_categories?: Partial<Record<'system_tools' | 'messages' | 'skills' | 'mcp_tools' | 'system_prompt' | 'other', number>>
+  context_categories?: Partial<Record<'system_tools' | 'messages' | 'skills' | 'mcp_tools' | 'system_prompt' | 'memory' | 'other', number>>
 }
 export interface ConnectionRetryEvent { event_type: 'connection_retry'; attempt: number; max_attempts: number; delay?: number; delay_ms?: number; message: string }
 export interface StreamResetEvent { event_type: 'stream_reset' }

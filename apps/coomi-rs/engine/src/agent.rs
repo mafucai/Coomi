@@ -291,9 +291,17 @@ impl Agent {
         let usage_snapshot = session.usage.clone();
         let usage_before = usage_snapshot.total_tokens();
         let started = Instant::now();
+        let user_text = prompt.content.clone();
         let mut result = self
             .run_turn_message(session, prompt, provider, tools, approval, observer)
             .await;
+        let assistant_text = session
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == crate::Role::Assistant && !message.internal)
+            .map(|message| message.content.clone())
+            .unwrap_or_default();
         let lifecycle = tools
             .lifecycle(
                 "turn_end",
@@ -301,6 +309,8 @@ impl Agent {
                     "session_id": session.id,
                     "success": result.is_ok(),
                     "error": result.as_ref().err().map(ToString::to_string),
+                    "user": user_text,
+                    "assistant": assistant_text,
                 }),
             )
             .await;
@@ -1117,6 +1127,59 @@ mod tests {
             .expect("agent turn");
         assert_eq!(output, "done");
         assert_eq!(session.messages.len(), 4);
+    }
+
+    struct RecordingLifecycle {
+        payload: Mutex<Option<serde_json::Value>>,
+    }
+
+    #[async_trait]
+    impl ToolRuntime for RecordingLifecycle {
+        fn specs(&self) -> Vec<ToolSpec> {
+            EchoTool.specs()
+        }
+
+        async fn call(&self, call: &ToolCall, approval: &dyn ApprovalHandler) -> ToolResult {
+            EchoTool.call(call, approval).await
+        }
+
+        async fn lifecycle(&self, event: &str, payload: serde_json::Value) -> Result<Option<String>, String> {
+            if event == "turn_end" {
+                *self.payload.lock().expect("lock payload") = Some(payload);
+            }
+            Ok(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn turn_end_includes_user_and_assistant_text() {
+        let mut session = Session::new("mock", "mock-model", PathBuf::from("."));
+        let provider = MockProvider {
+            calls: Mutex::new(0),
+        };
+        let tools = RecordingLifecycle {
+            payload: Mutex::new(None),
+        };
+        Agent::new("test")
+            .run_turn(
+                &mut session,
+                "please run the check",
+                &provider,
+                &tools,
+                &Approve,
+                &NoopObserver,
+            )
+            .await
+            .expect("agent turn");
+        let payload = tools
+            .payload
+            .lock()
+            .expect("lock payload")
+            .clone()
+            .expect("turn_end payload");
+        assert_eq!(payload["user"], "please run the check");
+        assert_eq!(payload["assistant"], "done");
+        assert_eq!(payload["success"], true);
     }
 
     struct ParallelReadTools;
