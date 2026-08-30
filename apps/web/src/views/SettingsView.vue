@@ -224,7 +224,7 @@ onMounted(async () => {
           <span class="ri" :class="{ on: config.customPrompt.trim() !== '' }"><CoomiIcon name="sparkle" :size="17" /></span>
           <span class="rt">
             <span class="rmain">定制身份定位</span>
-            <span class="rsub">{{ config.customPrompt.trim() ? '已配置，置于系统提示词最前生效' : '未设置。让 AI 认知自己的身份与定位' }}</span>
+            <span class="rsub">{{ config.customPrompt.trim() ? '已配置。当前会话下次发送即生效' : '未设置。让 AI 认知自己的身份与定位' }}</span>
           </span>
           <CoomiIcon name="chevronRight" :size="15" class="arw" />
         </button>

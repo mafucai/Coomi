@@ -42,10 +42,13 @@ const activeModelGroup = computed(() => modelGroups.value.find(group => group.id
 const usagePercent = computed(() => Math.min(100, Math.max(0, Math.round((session.usage?.contextRatio ?? 0) * 100))))
 const usageStroke = computed(() => `${usagePercent.value} ${100 - usagePercent.value}`)
 const effortLabels = { auto: '自动', low: '低', medium: '中', high: '高', xhigh: '超高' } as const
-const categoryLabels = { system_tools: '系统工具', messages: '消息', skills: '技能', mcp_tools: 'MCP 工具', system_prompt: '系统提示', other: '其他' } as const
+const categoryLabels = { system_tools: '系统工具', messages: '消息', skills: '技能', mcp_tools: 'MCP 工具', system_prompt: '系统提示', memory: '记忆', other: '其他' } as const
 const categoryTotal = computed(() => Object.values(session.usage?.contextCategories ?? {}).reduce((sum, value) => sum + (value ?? 0), 0))
 function categoryPercent(value: number | undefined): string {
   return categoryTotal.value > 0 ? `${((value ?? 0) / categoryTotal.value * 100).toFixed(1)}%` : '--'
+}
+function categoryTokens(value: number | undefined): string {
+  return formatTokens(value ?? 0)
 }
 
 function formatTokens(value: number): string {
@@ -213,7 +216,7 @@ function browseInFileManager() {
       <template v-if="session.usage">
         <p class="usage-subtitle">上下文构成</p>
         <div class="category-grid">
-          <div v-for="(label, category) in categoryLabels" :key="category"><span>{{ label }}</span><strong>{{ categoryPercent(session.usage.contextCategories[category]) }}</strong></div>
+          <div v-for="(label, category) in categoryLabels" :key="category"><span>{{ label }}</span><strong>{{ categoryTokens(session.usage.contextCategories[category]) }} · {{ categoryPercent(session.usage.contextCategories[category]) }}</strong></div>
         </div>
         <p class="usage-subtitle">各推理强度均轮统计</p>
         <div class="effort-table">

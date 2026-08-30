@@ -76,7 +76,7 @@ async function save() {
         </button>
         <p v-if="savedNote" class="note ok-note">{{ savedNote }}</p>
         <p v-if="error" class="err">{{ error }}</p>
-        <p class="note">清空内容后保存即可移除身份定位。保存后下一次发送消息即生效（每轮对话都会读取最新配置）。</p>
+        <p class="note">清空内容后保存即可移除身份定位。保存后，当前会话的下一次发送就会读取最新配置；已经发出的旧轮次不会回溯改写。</p>
       </div>
     </main>
   </div>

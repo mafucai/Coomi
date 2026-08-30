@@ -158,6 +158,16 @@ impl SkillRouter {
     }
 
     pub fn route(&self, text: &str, context: &SkillRouteContext) -> Result<SkillRouteResult> {
+        self.route_with_mode(text, context, crate::ContextMode::Act)
+    }
+
+    /// Ask turns only record routing decisions; they never inject Skill bodies.
+    pub fn route_with_mode(
+        &self,
+        text: &str,
+        context: &SkillRouteContext,
+        mode: crate::ContextMode,
+    ) -> Result<SkillRouteResult> {
         let query = tokenize(text);
         let extensions = context
             .attachments
@@ -218,6 +228,16 @@ impl SkillRouter {
                     score,
                     reasons,
                     conflict: Some(conflict),
+                });
+                continue;
+            }
+            if mode.is_ask() {
+                decisions.push(SkillRouteDecision {
+                    name: entry.name.clone(),
+                    status: SkillRouteStatus::Discovered,
+                    score,
+                    reasons,
+                    conflict: Some("ask mode skips Skill body injection".into()),
                 });
                 continue;
             }
@@ -605,6 +625,32 @@ mod tests {
         assert_eq!(result.decisions[0].name, "Rust review");
         assert_eq!(result.decisions[0].status, SkillRouteStatus::Used);
         assert!(result.instructions.contains("Run cargo test"));
+    }
+
+    #[test]
+    fn ask_mode_does_not_inject_skill_bodies() {
+        let home = tempfile::tempdir().expect("temporary home");
+        install_skill(
+            home.path(),
+            "rust-review",
+            "---\nname: Rust review\nkeywords: [review, rust]\n---\n# Review\nRun cargo test.",
+            true,
+        );
+        let router = SkillRouter::load(home.path()).expect("load router");
+        let result = router
+            .route_with_mode(
+                "review this rust module",
+                &SkillRouteContext::default(),
+                crate::ContextMode::Ask,
+            )
+            .expect("route");
+        assert!(result.instructions.is_empty());
+        assert!(
+            result
+                .decisions
+                .iter()
+                .any(|item| item.status == SkillRouteStatus::Discovered)
+        );
     }
 
     #[test]

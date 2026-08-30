@@ -30,7 +30,7 @@ export const useSessionStore = defineStore('session', () => {
     cachedInput: number; cacheHitRate: number | null; cacheDataAvailable: boolean
     turnCacheHitRate: number | null; turnCacheDataAvailable: boolean
     reasoningEfforts: Partial<Record<ReasoningEffort, ReasoningEffortStats>>
-    contextCategories: Partial<Record<'system_tools' | 'messages' | 'skills' | 'mcp_tools' | 'system_prompt' | 'other', number>>
+    contextCategories: Partial<Record<'system_tools' | 'messages' | 'skills' | 'mcp_tools' | 'system_prompt' | 'memory' | 'other', number>>
     firstTokenLatencyMs: number | null
     outputTokensPerSecond: number | null
     turnTotalTokens: number | null

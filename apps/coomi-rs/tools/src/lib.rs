@@ -69,6 +69,7 @@ pub struct CoreTools {
     memory: Option<Arc<MemoryManager>>,
     hooks: Option<Arc<HookRunner>>,
     parent_history: Vec<coomi_engine::ChatMessage>,
+    compact_specs: bool,
 }
 
 impl CoreTools {
@@ -88,7 +89,13 @@ impl CoreTools {
             memory: None,
             hooks: None,
             parent_history: Vec::new(),
+            compact_specs: false,
         }
+    }
+
+    pub fn with_compact_specs(mut self, compact: bool) -> Self {
+        self.compact_specs = compact;
+        self
     }
 
     pub fn with_agent_scheduler(
@@ -1871,6 +1878,9 @@ impl CoreTools {
 #[async_trait]
 impl ToolRuntime for CoreTools {
     fn specs(&self) -> Vec<ToolSpec> {
+        if self.compact_specs {
+            return ask_mode_specs(self.skills_directory.is_some());
+        }
         let mut specs = vec![
             ToolSpec {
                 name: "read_file".into(),
@@ -2466,6 +2476,55 @@ impl ToolRuntime for CoreTools {
 
 const fn default_memory_scope() -> MemoryScope {
     MemoryScope::Project
+}
+
+fn ask_mode_specs(skills_available: bool) -> Vec<ToolSpec> {
+    let mut specs = vec![
+        ToolSpec {
+            name: "list_skills".into(),
+            description: "List installed Skills that can be loaded on demand.".into(),
+            parameters: json!({"type":"object","properties":{},"additionalProperties":false}),
+        },
+        ToolSpec {
+            name: "read_skill".into(),
+            description: "Load the full instructions for one installed Skill.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"],
+                "additionalProperties": false
+            }),
+        },
+        ToolSpec {
+            name: "web_search".into(),
+            description: "Search the web and return ranked result links with short snippets.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 10}
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            }),
+        },
+        ToolSpec {
+            name: "request_user_input".into(),
+            description: "Ask the user one to five short questions in one batch and wait until the batch is submitted.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "questions": {"type": "array"}
+                },
+                "required": ["questions"],
+                "additionalProperties": false
+            }),
+        },
+    ];
+    if !skills_available {
+        specs.retain(|spec| spec.name != "list_skills" && spec.name != "read_skill");
+    }
+    specs
 }
 
 fn memory_specs() -> Vec<ToolSpec> {

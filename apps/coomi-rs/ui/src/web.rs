@@ -6297,10 +6297,15 @@ async fn run_turn(
     if cognitive_enabled {
         prompt_context.push_str(&cognitive_prompt_context(life_context.as_ref().expect("life context"))?);
     }
+    let context_mode = if recovery {
+        coomi_services::ContextMode::Act
+    } else {
+        coomi_services::classify_context_mode(prompt)
+    };
     let mut routed_skills = Vec::new();
     if !recovery && prompt.chars().count() >= 24 {
         let router = SkillRouter::load(&state.home)?;
-        let routed = router.route(
+        let routed = router.route_with_mode(
             prompt,
             &SkillRouteContext {
                 attachments: Vec::new(),
@@ -6309,8 +6314,9 @@ async fn run_turn(
                 network_allowed: policy_mode != AccessMode::ReadOnly,
                 destructive_allowed: policy_mode == AccessMode::FullAccess,
             },
+            context_mode,
         )?;
-        if !routed.instructions.is_empty() {
+        if !context_mode.is_ask() && !routed.instructions.is_empty() {
             prompt_context.push_str("\n\nProactively routed Skills (already read; user and project rules take precedence):");
             prompt_context.push_str(&routed.instructions);
         }
@@ -6323,7 +6329,11 @@ async fn run_turn(
     }
     // 注入已配置 MCP 清单：agent 需要知道装了哪些 MCP、状态如何、能调哪些工具。
     let mcp_runtime = Arc::new(McpRuntime::load(&state.home).await);
-    let mcp_inventory = mcp_runtime.inventory();
+    let mcp_inventory = if context_mode.is_ask() {
+        mcp_runtime.compact_inventory()
+    } else {
+        mcp_runtime.inventory()
+    };
     if !mcp_inventory.is_empty() {
         prompt_context.push_str("\n\n");
         prompt_context.push_str(&mcp_inventory);
@@ -6346,7 +6356,7 @@ async fn run_turn(
     )
     .with_sub_agents(sub_agents, fallback_sub_agent_id)
     .without_persistent_memory();
-    let tools = CoreTools::new(cwd.clone(), policy)
+    let mut tools = CoreTools::new(cwd.clone(), policy)
         .with_skills_directory(state.home.join("skills"))
         .with_config_home(state.home.clone())
         .with_session_state(session.plan.clone(), session.loop_state.clone())
@@ -6354,6 +6364,9 @@ async fn run_turn(
         .with_memory(Arc::new(MemoryManager::new(&state.home, &cwd)))
         .with_hooks(Arc::new(HookRunner::load(&state.home)?))
         .with_agent_scheduler(scheduler, session.messages.clone());
+    if context_mode.is_ask() {
+        tools = tools.with_compact_specs(true);
+    }
     // Expose the turn's process manager so `cancel` can kill any shell started by tools.
     *task
         .processes
@@ -6379,6 +6392,7 @@ async fn run_turn(
         &session,
         &tools.specs(),
         &mcp_runtime.specs(),
+        context_mode,
     );
     let observer = BrowserObserver::new(
         Arc::clone(&task),
@@ -7050,11 +7064,12 @@ fn estimated_tokens(value: &str) -> u64 {
 }
 
 fn estimate_context_categories(
-    home: &Path,
+    _home: &Path,
     system_prompt: &str,
     session: &Session,
     tool_specs: &[coomi_engine::ToolSpec],
     mcp_specs: &[coomi_engine::ToolSpec],
+    _context_mode: coomi_services::ContextMode,
 ) -> BTreeMap<String, u64> {
     let mcp_names = mcp_specs
         .iter()
@@ -7079,18 +7094,23 @@ fn estimate_context_categories(
             ))
         })
         .sum();
-    let skills = list_installed_skills(home)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|skill| skill.enabled)
-        .map(|skill| estimated_tokens(&format!("{} {}", skill.name, skill.source)))
-        .sum();
+    let routed_skill_tokens = if let Some(offset) = system_prompt.find("Proactively routed Skills") {
+        estimated_tokens(&system_prompt[offset..])
+    } else {
+        0
+    };
+    let memory_tokens = if let Some(offset) = system_prompt.find("Persistent memory") {
+        estimated_tokens(&system_prompt[offset..])
+    } else {
+        0
+    };
     BTreeMap::from([
         ("system_tools".to_owned(), system_tools),
         ("messages".to_owned(), messages),
-        ("skills".to_owned(), skills),
+        ("skills".to_owned(), routed_skill_tokens),
         ("mcp_tools".to_owned(), mcp_tools),
-        ("system_prompt".to_owned(), estimated_tokens(system_prompt)),
+        ("system_prompt".to_owned(), estimated_tokens(system_prompt).saturating_sub(routed_skill_tokens).saturating_sub(memory_tokens)),
+        ("memory".to_owned(), memory_tokens),
         ("other".to_owned(), 0),
     ])
 }
