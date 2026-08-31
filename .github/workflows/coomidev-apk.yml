@@ -126,21 +126,17 @@ jobs:
             "ndk;27.0.12077973"
 
       - name: Write preview signing properties
-        env:
-          STORE_PASSWORD: ${{ secrets.COOMI_PREVIEW_STORE_PASSWORD }}
-          KEY_PASSWORD: ${{ secrets.COOMI_PREVIEW_KEY_PASSWORD }}
         run: |
-          if [ -z "$STORE_PASSWORD" ] || [ -z "$KEY_PASSWORD" ]; then
-            echo "Missing GitHub secrets COOMI_PREVIEW_STORE_PASSWORD and/or COOMI_PREVIEW_KEY_PASSWORD" >&2
-            echo "Add them at https://github.com/${{ github.repository }}/settings/secrets/actions" >&2
-            echo "They are the store/key passwords for apps/coomi-app/app/testkey_untrusted.jks" >&2
-            exit 1
-          fi
+          set -euo pipefail
+          PASS="$(openssl rand -hex 16)"
+          rm -f apps/coomi-app/app/testkey_untrusted.jks
+          keytool -genkeypair             -keystore apps/coomi-app/app/testkey_untrusted.jks             -alias alias             -keyalg RSA             -keysize 2048             -validity 3650             -storepass "$PASS"             -keypass "$PASS"             -dname "CN=CoomiDev Preview, OU=Preview, O=Coomi, L=Local, ST=NA, C=CN"
           {
             echo "sdk.dir=$ANDROID_SDK_ROOT"
-            echo "coomi.signing.storePassword=$STORE_PASSWORD"
-            echo "coomi.signing.keyPassword=$KEY_PASSWORD"
+            echo "coomi.signing.storePassword=$PASS"
+            echo "coomi.signing.keyPassword=$PASS"
           } > local.properties
+          echo "preview signing key generated for this run only"
 
       - name: Assemble CoomiDev preview APK
         env:
