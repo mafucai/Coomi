@@ -143,6 +143,7 @@ jobs:
           ANDROID_NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}/ndk/27.0.12077973
           COOMI_NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}/ndk/27.0.12077973
         run: |
+          npm ci --prefix apps/web
           chmod +x gradlew
           COOMI_DEV_BUILD=1 ./gradlew --no-daemon --max-workers=2 :app:assembleRelease
 
