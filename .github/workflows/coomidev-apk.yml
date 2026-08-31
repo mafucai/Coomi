@@ -1,0 +1,138 @@
+name: CoomiDev APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Source ref to build
+        required: false
+        type: string
+        default: codex/custom-ask-act-context
+      upload_apk:
+        description: Upload the preview APK artifact
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      COOMI_DEV_BUILD: "1"
+      ANDROID_SDK_ROOT: ${{ github.workspace }}/.android-sdk
+      ANDROID_HOME: ${{ github.workspace }}/.android-sdk
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ inputs.ref || github.ref_name }}
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95.0"
+          targets: aarch64-linux-android
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            apps/coomi-rs/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('apps/coomi-rs/Cargo.lock') }}
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', 'gradle/wrapper/gradle-wrapper.properties') }}
+
+      - name: Install Android SDK and NDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: |
+            platform-tools
+            platforms;android-36
+            build-tools;35.0.0
+            ndk;27.0.12077973
+
+      - name: Rust tests
+        working-directory: apps/coomi-rs
+        run: cargo test -- --test-threads=2
+
+      - name: Frontend checks
+        working-directory: apps/web
+        run: |
+          npm ci
+          npm run type-check
+          npm test
+          npm run build
+
+      - name: Write preview signing properties
+        env:
+          STORE_PASSWORD: ${{ secrets.COOMI_PREVIEW_STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.COOMI_PREVIEW_KEY_PASSWORD }}
+        run: |
+          if [ -z "$STORE_PASSWORD" ] || [ -z "$KEY_PASSWORD" ]; then
+            echo "Missing GitHub secrets COOMI_PREVIEW_STORE_PASSWORD and/or COOMI_PREVIEW_KEY_PASSWORD" >&2
+            exit 1
+          fi
+          cat > local.properties <<EOF
+          sdk.dir=$ANDROID_SDK_ROOT
+          coomi.signing.storePassword=$STORE_PASSWORD
+          coomi.signing.keyPassword=$KEY_PASSWORD
+          EOF
+
+      - name: Assemble CoomiDev preview APK
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}/ndk/27.0.12077973
+        run: |
+          chmod +x gradlew
+          COOMI_DEV_BUILD=1 ./gradlew --no-daemon --max-workers=2 :app:assembleRelease
+
+      - name: Verify APK identity
+        run: |
+          set -euo pipefail
+          apk=$(find apps/coomi-app/app/build/outputs/apk -name '*.apk' | head -n 1)
+          test -n "$apk"
+          BUILD_TOOLS="$ANDROID_SDK_ROOT/build-tools/35.0.0"
+          "$BUILD_TOOLS/aapt2" dump badging "$apk" | tee /tmp/apk-badging.txt
+          grep -F "package: name='com.coomidev.android'" /tmp/apk-badging.txt
+          grep -F "application-label:'CoomiDev'" /tmp/apk-badging.txt
+          grep -F "native-code: 'arm64-v8a'" /tmp/apk-badging.txt
+          "$BUILD_TOOLS/apksigner" verify --verbose "$apk"
+          mkdir -p dist
+          cp "$apk" dist/CoomiDev-preview.apk
+          sha256sum dist/CoomiDev-preview.apk > dist/CoomiDev-preview.apk.sha256
+          echo "preview=1" >> dist/BUILD.txt
+          echo "package=com.coomidev.android" >> dist/BUILD.txt
+          echo "label=CoomiDev" >> dist/BUILD.txt
+          echo "port=18765" >> dist/BUILD.txt
+          echo "run=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" >> dist/BUILD.txt
+
+      - name: Upload preview APK
+        if: ${{ inputs.upload_apk }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: coomidev-apk
+          path: |
+            dist/CoomiDev-preview.apk
+            dist/CoomiDev-preview.apk.sha256
+            dist/BUILD.txt
+          if-no-files-found: error
