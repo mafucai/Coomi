@@ -10,7 +10,6 @@ import org.json.JSONObject;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
-import java.io.IOException;
 import java.io.InputStream;
 import java.util.Iterator;
 import java.util.LinkedHashSet;
@@ -35,8 +34,8 @@ final class CoomiBackupArchive {
         File home = new File(CoomiConstants.COOMI_CONFIG_DIR);
         File virtualHome = new File(TermuxConstants.TERMUX_HOME_DIR_PATH);
         notifyProgress(listener, "正在扫描备份内容", 0, 0);
-        long totalBytes = countDirectoryBytes(home, "coomi-home", false, false)
-            + countDirectoryBytes(virtualHome, "user-data", true, true);
+        long totalBytes = countDirectoryBytes(home, false, false)
+            + countDirectoryBytes(virtualHome, true, true);
         long[] processedBytes = {0};
         notifyProgress(listener, "正在压缩备份", 0, totalBytes);
         File archive = File.createTempFile("coomi-backup-", ".zip", context.getCacheDir());
@@ -65,9 +64,7 @@ final class CoomiBackupArchive {
         File[] children = directory.listFiles();
         if (children == null) return;
         for (File child : children) {
-            String childName = child.getName();
-            if (shouldSkipBackupEntry(prefix, childName)) continue;
-            String name = prefix + "/" + childName;
+            String name = prefix + "/" + child.getName();
             if (child.isDirectory()) addDirectory(output, child, name, listener, processedBytes, totalBytes);
             else addFile(output, name, child, listener, processedBytes, totalBytes);
         }
@@ -79,7 +76,7 @@ final class CoomiBackupArchive {
         if (children == null) return;
         for (File child : children) {
             String name = child.getName();
-            if ((root && ".coomi".equals(name)) || shouldSkipBackupEntry(prefix, name)) continue;
+            if ((root && ".coomi".equals(name)) || isEnvironmentEntry(name)) continue;
             String entryName = prefix + "/" + name;
             if (child.isDirectory()) addUserData(output, child, entryName, false, listener, processedBytes, totalBytes);
             else addFile(output, entryName, child, listener, processedBytes, totalBytes);
@@ -94,56 +91,6 @@ final class CoomiBackupArchive {
             || lower.equals("env") || lower.equals("__pycache__") || lower.equals("tmp")
             || lower.equals(".tmp") || lower.equals(".bash_history") || lower.equals(".zsh_history")
             || lower.equals(".bashrc") || lower.equals(".zshrc") || lower.equals(".profile");
-    }
-
-    static boolean isVirtualFsName(String name) {
-        if (name == null) return false;
-        String lower = name.toLowerCase(Locale.US);
-        return "dev".equals(lower) || "proc".equals(lower) || "sys".equals(lower)
-            || "run".equals(lower) || "fd".equals(lower);
-    }
-
-    static boolean shouldSkipBackupEntry(String parentPrefix, String name) {
-        if (name == null || name.isEmpty() || name.contains("..") || name.contains("/") || name.contains("\\")) {
-            return true;
-        }
-        if (isEnvironmentEntry(name)) return true;
-        String prefix = parentPrefix == null ? "" : parentPrefix.replace('\\', '/');
-        String path = prefix.isEmpty() ? name : prefix + "/" + name;
-        if (isVirtualFsMount(path)) return true;
-        return isRuntimeEnvironmentPath(path);
-    }
-
-    static boolean isVirtualFsMount(String archivePath) {
-        if (archivePath == null || archivePath.isEmpty()) return false;
-        String path = archivePath.replace('\\', '/').toLowerCase(Locale.US);
-        String[] parts = path.split("/");
-        for (int index = 0; index < parts.length; index++) {
-            String part = parts[index];
-            if (!isVirtualFsName(part)) continue;
-            if (index == 0) return true;
-            String parent = parts[index - 1];
-            if ("rootfs".equals(parent) || "versions".equals(parent) || "runtime-v2".equals(parent)) return true;
-        }
-        return false;
-    }
-
-    static boolean isRuntimeEnvironmentPath(String archivePath) {
-        if (archivePath == null || archivePath.isEmpty()) return false;
-        String path = archivePath.replace('\\', '/').toLowerCase(Locale.US);
-        return matchesRuntimeChild(path, "versions")
-            || matchesRuntimeChild(path, "downloads")
-            || matchesRuntimeChild(path, "tmp")
-            || matchesRuntimeChild(path, "node20")
-            || path.equals("coomi-home/cache")
-            || path.startsWith("coomi-home/cache/");
-    }
-
-    private static boolean matchesRuntimeChild(String path, String child) {
-        String marker = "/runtime-v2/" + child;
-        return path.equals("runtime-v2/" + child)
-            || path.endsWith(marker)
-            || path.contains(marker + "/");
     }
 
     private static void addMcpFiles(ZipOutputStream output, File config, ProgressListener listener,
@@ -195,16 +142,9 @@ final class CoomiBackupArchive {
 
     private static void addFile(ZipOutputStream output, String name, File source,
                                 ProgressListener listener, long[] processedBytes, long totalBytes) throws Exception {
-        if (!source.isFile() || source.isDirectory()) return;
-        InputStream input;
-        try {
-            input = new FileInputStream(source);
-        } catch (IOException | SecurityException ignored) {
-            // /dev/fd and other virtual or SELinux-blocked handles must not fail the whole backup.
-            return;
-        }
+        if (!source.isFile()) return;
         output.putNextEntry(new ZipEntry(name));
-        try {
+        try (InputStream input = new FileInputStream(source)) {
             byte[] buffer = new byte[65536];
             int read;
             while ((read = input.read(buffer)) >= 0) {
@@ -212,24 +152,18 @@ final class CoomiBackupArchive {
                 processedBytes[0] += read;
                 notifyProgress(listener, "正在压缩备份", processedBytes[0], totalBytes);
             }
-        } catch (IOException | SecurityException ignored) {
-            // Skip this entry; keep packing the rest of the archive.
-        } finally {
-            try { input.close(); } catch (IOException ignored) { }
-            output.closeEntry();
         }
+        output.closeEntry();
     }
 
-    private static long countDirectoryBytes(File directory, String prefix, boolean userData, boolean root) {
+    private static long countDirectoryBytes(File directory, boolean userData, boolean root) {
         File[] children = directory.listFiles();
         if (children == null) return 0;
         long total = 0;
         for (File child : children) {
             String name = child.getName();
-            if (userData && root && ".coomi".equals(name)) continue;
-            if (shouldSkipBackupEntry(prefix, name)) continue;
-            String childPrefix = prefix + "/" + name;
-            if (child.isDirectory()) total += countDirectoryBytes(child, childPrefix, userData, false);
+            if (userData && ((root && ".coomi".equals(name)) || isEnvironmentEntry(name))) continue;
+            if (child.isDirectory()) total += countDirectoryBytes(child, userData, false);
             else if (child.isFile()) total += Math.max(0, child.length());
         }
         return total;
@@ -240,11 +174,7 @@ final class CoomiBackupArchive {
         if (relative.isEmpty()) return true;
         String[] parts = relative.split("[\\\\/]");
         if (parts.length == 0 || ".coomi".equals(parts[0])) return false;
-        String prefix = "";
-        for (String part : parts) {
-            if (shouldSkipBackupEntry(prefix, part)) return false;
-            prefix = prefix.isEmpty() ? part : prefix + "/" + part;
-        }
+        for (String part : parts) if (isEnvironmentEntry(part)) return false;
         return true;
     }
 

@@ -424,7 +424,7 @@ public class CoomiBackupActivity extends Activity {
         if (children == null) return;
         for (File child : children) {
             String name = child.getName();
-            if (CoomiBackupArchive.shouldSkipBackupEntry(prefix, name)) continue;
+            if (name == null || name.contains("..") || name.contains("/")) continue;
             String entry = prefix + "/" + name;
             if (child.isDirectory()) addFileTree(zos, child, entry);
             else if (child.isFile()) addFileEntry(zos, entry, child);
@@ -485,12 +485,15 @@ public class CoomiBackupActivity extends Activity {
         File[] children = dir.listFiles();
         if (children == null) return;
         for (File c : children) {
-            if (CoomiBackupArchive.shouldSkipBackupEntry(prefix, c.getName())) continue;
             String entryName = prefix + "/" + c.getName();
             if (c.isDirectory()) {
                 addDirRecursive(zos, c, entryName);
             } else {
-                addFileEntry(zos, entryName, c);
+                zos.putNextEntry(new ZipEntry(entryName));
+                try (InputStream in = new FileInputStream(c)) {
+                    copyStream(in, zos);
+                }
+                zos.closeEntry();
             }
         }
     }
@@ -500,11 +503,21 @@ public class CoomiBackupActivity extends Activity {
         if (children == null) return;
         for (File child : children) {
             String name = child.getName();
-            if ((root && ".coomi".equals(name)) || CoomiBackupArchive.shouldSkipBackupEntry(prefix, name)) continue;
+            if ((root && ".coomi".equals(name)) || isEnvironmentEntry(name)) continue;
             String entryName = prefix + "/" + name;
             if (child.isDirectory()) addUserDataRecursive(zos, child, entryName, false);
             else addFileEntry(zos, entryName, child);
         }
+    }
+
+    private static boolean isEnvironmentEntry(String name) {
+        String lower = name.toLowerCase(Locale.US);
+        return lower.equals(".cache") || lower.equals(".npm") || lower.equals(".pnpm-store")
+            || lower.equals(".cargo") || lower.equals(".rustup") || lower.equals(".gradle")
+            || lower.equals("node_modules") || lower.equals("venv") || lower.equals(".venv")
+            || lower.equals("env") || lower.equals("__pycache__") || lower.equals("tmp")
+            || lower.equals(".tmp") || lower.equals(".bash_history") || lower.equals(".zsh_history")
+            || lower.equals(".bashrc") || lower.equals(".zshrc") || lower.equals(".profile");
     }
 
     @Override
@@ -594,13 +607,11 @@ public class CoomiBackupActivity extends Activity {
 
     private void addFileEntry(ZipOutputStream zos, String name, File f) throws Exception {
         if (!f.isFile()) return;
+        zos.putNextEntry(new ZipEntry(name));
         try (InputStream in = new FileInputStream(f)) {
-            zos.putNextEntry(new ZipEntry(name));
             copyStream(in, zos);
-            zos.closeEntry();
-        } catch (java.io.IOException | SecurityException ignored) {
-            // Virtual or SELinux-blocked files such as /dev/fd must not fail the backup.
         }
+        zos.closeEntry();
     }
 
     private void addTextEntry(ZipOutputStream zos, String name, String content) throws Exception {
