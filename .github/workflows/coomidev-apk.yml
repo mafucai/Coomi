@@ -2,22 +2,32 @@ name: CoomiDev APK
 
 on:
   push:
-    branches: [codex/custom-ask-act-context]
+    branches: [codex/progressive-memory-v145]
   workflow_dispatch:
     inputs:
       ref:
         description: Source ref to build
         required: false
         type: string
-        default: codex/custom-ask-act-context
+        default: codex/progressive-memory-v145
       upload_apk:
         description: Upload the preview APK artifact
         required: false
         type: boolean
         default: true
+      publish_release:
+        description: Publish the preview APK to a GitHub Release for fast phone downloads
+        required: false
+        type: boolean
+        default: false
+      release_tag:
+        description: Tag name to publish under (only used when publish_release is true)
+        required: false
+        type: string
+        default: coomidev-progressive-memory
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   test:
@@ -177,3 +187,23 @@ jobs:
             dist/CoomiDev-preview.apk.sha256
             dist/BUILD.txt
           if-no-files-found: error
+
+      - name: Publish preview APK to GitHub Release
+        if: ${{ inputs.publish_release == true }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          name: "CoomiDev progressive-memory preview"
+          body: |
+            Automated preview from `${{ inputs.ref || github.ref_name }}` (run ${{ github.run_id }}).
+
+            - Package: `com.coomidev.android`
+            - Application label: `CoomiDev`
+            - Default engine port: `18765`
+            - Includes ask/act context mode and progressive-memory host integration
+            - Signed with a per-run preview keystore; uninstall an earlier preview if Android rejects an update
+          files: |
+            dist/CoomiDev-preview.apk
+            dist/CoomiDev-preview.apk.sha256
+            dist/BUILD.txt
+          fail_on_unmatched_files: true

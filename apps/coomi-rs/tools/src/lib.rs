@@ -27,6 +27,7 @@ use coomi_services::McpRuntime;
 use coomi_services::MemoryManager;
 use coomi_services::MemoryScope;
 use coomi_services::MemoryType;
+use coomi_services::ProgressiveMemoryStore;
 use coomi_services::PathNamespace;
 use coomi_services::RuntimeBackend;
 use coomi_services::RuntimeBackendKind;
@@ -69,6 +70,7 @@ pub struct CoreTools {
     memory: Option<Arc<MemoryManager>>,
     hooks: Option<Arc<HookRunner>>,
     parent_history: Vec<coomi_engine::ChatMessage>,
+    progressive_memory: Option<Arc<ProgressiveMemoryStore>>,
     compact_specs: bool,
 }
 
@@ -89,12 +91,18 @@ impl CoreTools {
             memory: None,
             hooks: None,
             parent_history: Vec::new(),
+            progressive_memory: None,
             compact_specs: false,
         }
     }
 
     pub fn with_compact_specs(mut self, compact: bool) -> Self {
         self.compact_specs = compact;
+        self
+    }
+
+    pub fn with_progressive_memory(mut self, store: Arc<ProgressiveMemoryStore>) -> Self {
+        self.progressive_memory = Some(store);
         self
     }
 
@@ -2450,6 +2458,35 @@ impl ToolRuntime for CoreTools {
     }
 
     async fn lifecycle(&self, event: &str, payload: Value) -> Result<Option<String>, String> {
+        if event == "turn_end" {
+            if let Some(store) = &self.progressive_memory {
+                if payload
+                    .get("user_internal")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    return self.run_lifecycle_hooks(event, payload).await;
+                }
+                let Some(turn_id) = payload.get("turn_id").and_then(Value::as_str) else {
+                    return Err("turn_end payload is missing turn_id".into());
+                };
+                let user = payload.get("user").and_then(Value::as_str).unwrap_or_default();
+                let assistant = payload
+                    .get("assistant")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if let Err(error) = store.append_turn(turn_id, user, assistant) {
+                    // Conversation delivery must remain available if local memory
+                    // storage is temporarily unavailable. The stable turn id makes
+                    // a later replay safe rather than duplicating the raw turn.
+                    eprintln!("[progressive-memory] append failed: {error:#}");
+                }
+            }
+        }
+        self.run_lifecycle_hooks(event, payload).await
+    }
+
+    async fn run_lifecycle_hooks(&self, event: &str, payload: Value) -> Result<Option<String>, String> {
         let Some(hooks) = &self.hooks else {
             return Ok(None);
         };

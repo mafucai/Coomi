@@ -291,7 +291,9 @@ impl Agent {
         let usage_snapshot = session.usage.clone();
         let usage_before = usage_snapshot.total_tokens();
         let started = Instant::now();
+        let turn_id = prompt.id.clone();
         let user_text = prompt.content.clone();
+        let user_internal = prompt.internal;
         let mut result = self
             .run_turn_message(session, prompt, provider, tools, approval, observer)
             .await;
@@ -307,9 +309,11 @@ impl Agent {
                 "turn_end",
                 serde_json::json!({
                     "session_id": session.id,
+                    "turn_id": turn_id,
                     "success": result.is_ok(),
                     "error": result.as_ref().err().map(ToString::to_string),
                     "user": user_text,
+                    "user_internal": user_internal,
                     "assistant": assistant_text,
                 }),
             )
