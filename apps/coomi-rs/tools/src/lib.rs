@@ -2465,7 +2465,7 @@ impl ToolRuntime for CoreTools {
                     .and_then(Value::as_bool)
                     .unwrap_or(false)
                 {
-                    return self.run_lifecycle_hooks(event, payload).await;
+                    return run_lifecycle_hooks(self, event, payload).await;
                 }
                 let Some(turn_id) = payload.get("turn_id").and_then(Value::as_str) else {
                     return Err("turn_end payload is missing turn_id".into());
@@ -2483,32 +2483,36 @@ impl ToolRuntime for CoreTools {
                 }
             }
         }
-        self.run_lifecycle_hooks(event, payload).await
+        run_lifecycle_hooks(self, event, payload).await
     }
+}
 
-    async fn run_lifecycle_hooks(&self, event: &str, payload: Value) -> Result<Option<String>, String> {
-        let Some(hooks) = &self.hooks else {
-            return Ok(None);
-        };
-        let event = match event {
-            "session_start" => HookEvent::SessionStart,
-            "turn_start" => HookEvent::TurnStart,
-            "turn_end" => HookEvent::TurnEnd,
-            other => return Err(format!("unknown hook lifecycle event: {other}")),
-        };
-        let outcome = hooks
-            .run(event, None, payload)
-            .await
-            .map_err(|error| format!("{error:#}"))?;
-        if !outcome.allow {
-            return Err(if outcome.reason.is_empty() {
-                format!("{event:?} hook denied execution")
-            } else {
-                outcome.reason
-            });
-        }
-        Ok((!outcome.additional_context.trim().is_empty()).then_some(outcome.additional_context))
+async fn run_lifecycle_hooks(
+    tools: &CoreTools,
+    event: &str,
+    payload: Value,
+) -> Result<Option<String>, String> {
+    let Some(hooks) = &tools.hooks else {
+        return Ok(None);
+    };
+    let event = match event {
+        "session_start" => HookEvent::SessionStart,
+        "turn_start" => HookEvent::TurnStart,
+        "turn_end" => HookEvent::TurnEnd,
+        other => return Err(format!("unknown hook lifecycle event: {other}")),
+    };
+    let outcome = hooks
+        .run(event, None, payload)
+        .await
+        .map_err(|error| format!("{error:#}"))?;
+    if !outcome.allow {
+        return Err(if outcome.reason.is_empty() {
+            format!("{event:?} hook denied execution")
+        } else {
+            outcome.reason
+        });
     }
+    Ok((!outcome.additional_context.trim().is_empty()).then_some(outcome.additional_context))
 }
 
 const fn default_memory_scope() -> MemoryScope {
