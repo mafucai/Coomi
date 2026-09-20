@@ -45,7 +45,8 @@ jobs:
 - [ ] Java 17（temurin）
 - [ ] Android platform 35 + build-tools 35.0.0 显式安装
 - [ ] `./gradlew --no-daemon --max-workers=2`（限制并发防 OOM）
-- [ ] 签名 secrets 已配：`KEYSTORE_BASE64` / `KEYSTORE_PASSWORD` / `KEYSTORE_ALIAS`
+- [ ] 签名 secrets 已配：`KEYSTORE_BASE64` / `KEYSTORE_PASSWORD` / `KEYSTORE_ALIAS` / `KEY_PASSWORD`
+- [ ] 项目如已有固定签名，先读项目签名资产文档；禁止因无法读取 Secret 明文而重新生成签名
 - [ ] 构建产物路径正确：`app/build/outputs/apk/release/*.apk`
 - [ ] `apksigner verify` 已加
 - [ ] 有 `if-no-files-found: error`（防静默失败）
@@ -78,7 +79,17 @@ jobs:
 
 ---
 
-## 4. 失败台账（真实记录，持续更新）
+## 4. 已登记的固定签名资产
+
+| 项目 | 状态 | 权威说明 |
+|---|---|---|
+| `mafucai/futures-terminal` | 已启用固定签名；私钥备份位于独立 Private 仓库 | `/workspace/repos/futures-terminal/docs/ANDROID_SIGNING.md` |
+
+> 所有 AI：这里只登记资产存在及文档入口。不得把密码、Base64、Token 或私钥正文复制到公共文档；不得重新生成签名替换已有密钥。
+
+---
+
+## 5. 失败台账（真实记录，持续更新）
 
 | # | 失败现象 | 根因 | 应对 |
 |---|---|---|---|
@@ -93,7 +104,7 @@ jobs:
 
 ---
 
-## 5. 硬规矩（铁律）
+## 6. 硬规矩（铁律）
 
 1. **编译只在云端** —— 本地不装 Android SDK/NDK
 2. **本地验证全绿 → 给主人看 → 确认后才 push**（不经此流程直接 push 视为违规）
@@ -103,7 +114,7 @@ jobs:
 
 ---
 
-## 6. 与其他文档的关系
+## 7. 与其他文档的关系
 
 | 文档 | 说明 |
 |---|---|
