@@ -95,7 +95,7 @@ jobs:
           key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', 'gradle/wrapper/gradle-wrapper.properties') }}
 
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
 
       - name: Install Android SDK and NDK
         run: |
@@ -104,14 +104,17 @@ jobs:
           test -n "$ANDROID_SDK_ROOT"
           echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
           echo "ANDROID_HOME=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
-          SDKMANAGER="$(find "$ANDROID_SDK_ROOT/cmdline-tools" -name sdkmanager -type f | head -n 1)"
-          test -n "$SDKMANAGER"
+          SDKMANAGER="$(find "$ANDROID_SDK_ROOT/cmdline-tools" -name sdkmanager -type f | sort | tail -n 1)"
+          test -n "$SDKMANAGER" || { echo "::error::sdkmanager not found under $ANDROID_SDK_ROOT"; exit 1; }
+          echo "using sdkmanager: $SDKMANAGER"
           yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
           "$SDKMANAGER" \
             "platform-tools" \
             "platforms;android-36" \
             "build-tools;35.0.0" \
             "ndk;27.0.12077973"
+          echo "--- installed packages ---"
+          ls -1 "$ANDROID_SDK_ROOT/platforms" "$ANDROID_SDK_ROOT/build-tools" "$ANDROID_SDK_ROOT/ndk"
 
       # ---- 关键步骤：下载并校验 Runtime V2 内置环境 ----
       - name: Download Runtime V2 assets
@@ -164,14 +167,14 @@ jobs:
           echo "per-run preview signing key generated"
 
       - name: Assemble CoomiDev APK
-        env:
-          ANDROID_NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}/ndk/27.0.12077973
-          COOMI_NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}/ndk/27.0.12077973
         run: |
           set -euo pipefail
           npm ci --prefix apps/web
           chmod +x gradlew
-          COOMI_DEV_BUILD=1 ./gradlew --no-daemon --max-workers=2 :app:assembleRelease
+          export COOMI_DEV_BUILD=1
+          export ANDROID_NDK_HOME="$ANDROID_SDK_ROOT/ndk/27.0.12077973"
+          export COOMI_NDK_HOME="$ANDROID_SDK_ROOT/ndk/27.0.12077973"
+          ./gradlew --no-daemon --max-workers=2 :app:assembleRelease
 
       # ---- 双重防废包检查 ----
       - name: Verify APK identity and bundled runtime
