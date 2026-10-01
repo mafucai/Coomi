@@ -8,6 +8,11 @@ name: CoomiDev APK (v1.4.8, full runtime)
 # 缺少该步骤会产出约 39 MB 的“废包”（无内置环境）。
 
 on:
+  push:
+    branches: [codex/coomidev-v148-full]
+    paths:
+      - ".github/workflows/coomidev-v148-full.yml"
+      - "apps/**"
   workflow_dispatch:
     inputs:
       ref:
@@ -236,10 +241,10 @@ jobs:
           if-no-files-found: error
 
       - name: Publish APK to GitHub Release
-        if: ${{ inputs.publish_release == true }}
+        if: ${{ github.event_name == 'push' || inputs.publish_release == true }}
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.release_tag }}
+          tag_name: ${{ inputs.release_tag || 'coomidev-v1.4.8-full' }}
           name: "CoomiDev v1.4.8 (full runtime)"
           body: |
             CoomiDev preview built from `${{ inputs.ref || github.ref_name }}` (run ${{ github.run_id }}).
