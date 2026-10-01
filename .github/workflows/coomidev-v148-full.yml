@@ -1,0 +1,264 @@
+name: CoomiDev APK (v1.4.8, full runtime)
+
+# 目标：构建包含官方 Runtime V2 内置环境的完整 CoomiDev APK。
+#
+# 与历史 CoomiDev workflow 的关键区别：先下载 runtime-v2 资产并放入
+# runtime-v2-dist/，使 Gradle 任务 stageCoomiRuntimeV2 的 SHA256 校验通过，
+# 从而把 proot-host 与 ubuntu-noble rootfs 打进 APK。
+# 缺少该步骤会产出约 39 MB 的“废包”（无内置环境）。
+
+on:
+  push:
+    branches: [codex/coomidev-v148-full]
+    paths:
+      - ".github/workflows/coomidev-v148-full.yml"
+      - "apps/**"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Source ref to build
+        required: false
+        type: string
+        default: codex/coomidev-v148-full
+      publish_release:
+        description: Publish the APK to a GitHub Release for direct phone download
+        required: false
+        type: boolean
+        default: true
+      release_tag:
+        description: Tag name to publish under (only used when publish_release is true)
+        required: false
+        type: string
+        default: coomidev-v1.4.8-full
+
+permissions:
+  contents: write
+
+env:
+  # Runtime V2 assets mirrored from the official Coomi v1.4.8 APK,
+  # byte-for-byte identical to the manifest shipped in the APK.
+  RUNTIME_ASSET_BASE: https://github.com/mafucai/coomi-runtime-assets/releases/download/runtime-v2-ubuntu-noble-20260907
+  RUNTIME_HOST_SHA256: 77eb98f3d528bb83db0bba6fec703f577724dd7fefcaf8cafc34607eaac60f0e
+  RUNTIME_ROOTFS_SHA256: b21e06186c0ad6bfaca7e6d6ff27b0e4d2e592a320e98b2a20d32ab9a54e8769
+  RUNTIME_HOST_SIZE: "119181"
+  RUNTIME_ROOTFS_SIZE: "311219155"
+  # Minimum acceptable APK size. The official v1.4.8 APK is 355,310,063 bytes.
+  # Anything below this means the bundled runtime is missing or partial.
+  MIN_APK_BYTES: "320000000"
+
+jobs:
+  apk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      COOMI_DEV_BUILD: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref_name }}
+
+      - name: Setup Java JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+
+      - name: Setup Rust with Android target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95.0"
+          targets: aarch64-linux-android
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            apps/coomi-rs/target
+          key: ${{ runner.os }}-cargo-full-${{ hashFiles('apps/coomi-rs/Cargo.lock') }}
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', 'gradle/wrapper/gradle-wrapper.properties') }}
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install Android SDK and NDK
+        run: |
+          set -euo pipefail
+          : "${ANDROID_SDK_ROOT:=${ANDROID_HOME:-}}"
+          test -n "$ANDROID_SDK_ROOT"
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
+          SDKMANAGER="$(find "$ANDROID_SDK_ROOT/cmdline-tools" -name sdkmanager -type f | sort | tail -n 1)"
+          test -n "$SDKMANAGER" || { echo "::error::sdkmanager not found under $ANDROID_SDK_ROOT"; exit 1; }
+          echo "using sdkmanager: $SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+          "$SDKMANAGER" \
+            "platform-tools" \
+            "platforms;android-36" \
+            "build-tools;35.0.0" \
+            "ndk;27.0.12077973"
+          echo "--- installed packages ---"
+          ls -1 "$ANDROID_SDK_ROOT/platforms" "$ANDROID_SDK_ROOT/build-tools" "$ANDROID_SDK_ROOT/ndk"
+
+      # ---- 关键步骤：下载并校验 Runtime V2 内置环境 ----
+      - name: Download Runtime V2 assets
+        run: |
+          set -euo pipefail
+          mkdir -p runtime-v2-dist
+          curl -fL --retry 3 --retry-delay 5 -o runtime-v2-dist/proot-host-arm64.tar.gz \
+            "$RUNTIME_ASSET_BASE/proot-host-arm64.tar.gz"
+          curl -fL --retry 3 --retry-delay 5 -o runtime-v2-dist/ubuntu-noble-arm64.tar.gz \
+            "$RUNTIME_ASSET_BASE/ubuntu-noble-arm64.tar.gz"
+          ls -la runtime-v2-dist
+
+      - name: Verify Runtime V2 assets
+        run: |
+          set -euo pipefail
+          check() {
+            local file="$1" want_sha="$2" want_size="$3"
+            local got_size got_sha
+            got_size="$(stat -c %s "$file")"
+            got_sha="$(sha256sum "$file" | cut -d' ' -f1)"
+            echo "$file size=$got_size sha256=$got_sha"
+            if [ "$got_size" != "$want_size" ]; then
+              echo "::error::size mismatch for $file: got $got_size want $want_size"
+              exit 1
+            fi
+            if [ "$got_sha" != "$want_sha" ]; then
+              echo "::error::sha256 mismatch for $file"
+              exit 1
+            fi
+          }
+          check runtime-v2-dist/proot-host-arm64.tar.gz "$RUNTIME_HOST_SHA256" "$RUNTIME_HOST_SIZE"
+          check runtime-v2-dist/ubuntu-noble-arm64.tar.gz "$RUNTIME_ROOTFS_SHA256" "$RUNTIME_ROOTFS_SIZE"
+          echo "runtime assets verified"
+
+      - name: Write signing properties
+        run: |
+          set -euo pipefail
+          PASS="$(openssl rand -hex 16)"
+          rm -f apps/coomi-app/app/testkey_untrusted.jks
+          keytool -genkeypair \
+            -keystore apps/coomi-app/app/testkey_untrusted.jks \
+            -alias alias -keyalg RSA -keysize 2048 -validity 3650 \
+            -storepass "$PASS" -keypass "$PASS" \
+            -dname "CN=CoomiDev Preview, OU=Preview, O=Coomi, L=Local, ST=NA, C=CN"
+          {
+            echo "sdk.dir=$ANDROID_SDK_ROOT"
+            echo "coomi.signing.storePassword=$PASS"
+            echo "coomi.signing.keyPassword=$PASS"
+          } > local.properties
+          echo "per-run preview signing key generated"
+
+      - name: Assemble CoomiDev APK
+        run: |
+          set -euo pipefail
+          npm ci --prefix apps/web
+          chmod +x gradlew
+          export COOMI_DEV_BUILD=1
+          export ANDROID_NDK_HOME="$ANDROID_SDK_ROOT/ndk/27.0.12077973"
+          export COOMI_NDK_HOME="$ANDROID_SDK_ROOT/ndk/27.0.12077973"
+          ./gradlew --no-daemon --max-workers=2 :app:assembleRelease
+
+      # ---- 双重防废包检查 ----
+      - name: Verify APK identity and bundled runtime
+        run: |
+          set -euo pipefail
+          apk=$(find apps/coomi-app/app/build/outputs/apk -name '*.apk' | head -n 1)
+          test -n "$apk"
+          echo "apk=$apk"
+          BUILD_TOOLS="$ANDROID_SDK_ROOT/build-tools/35.0.0"
+
+          # 1) Package identity
+          "$BUILD_TOOLS/aapt2" dump badging "$apk" | tee /tmp/apk-badging.txt
+          grep -F "package: name='com.coomidev.android'" /tmp/apk-badging.txt
+          grep -F "application-label:'CoomiDev'" /tmp/apk-badging.txt
+          grep -F "native-code: 'arm64-v8a'" /tmp/apk-badging.txt
+
+          # 2) Signature
+          "$BUILD_TOOLS/apksigner" verify --verbose "$apk"
+
+          # 3) Size gate: a package without the bundled runtime is ~39 MB, far below this.
+          apk_bytes="$(stat -c %s "$apk")"
+          echo "apk_bytes=$apk_bytes min=$MIN_APK_BYTES"
+          if [ "$apk_bytes" -lt "$MIN_APK_BYTES" ]; then
+            echo "::error::APK is only $apk_bytes bytes (< $MIN_APK_BYTES). Bundled runtime is missing or partial."
+            exit 1
+          fi
+
+          # 4) Content gate: the bundled rootfs inside the APK must match the official hash.
+          mkdir -p /tmp/apkcheck
+          unzip -o -j "$apk" "assets/runtime-v2/ubuntu-noble-arm64.tgz" -d /tmp/apkcheck >/dev/null
+          unzip -o -j "$apk" "assets/runtime-v2/proot-host-arm64.tgz" -d /tmp/apkcheck >/dev/null
+          rootfs_sha="$(sha256sum /tmp/apkcheck/ubuntu-noble-arm64.tgz | cut -d' ' -f1)"
+          host_sha="$(sha256sum /tmp/apkcheck/proot-host-arm64.tgz | cut -d' ' -f1)"
+          echo "bundled rootfs sha256=$rootfs_sha"
+          echo "bundled host   sha256=$host_sha"
+          if [ "$rootfs_sha" != "$RUNTIME_ROOTFS_SHA256" ]; then
+            echo "::error::bundled rootfs does not match the official runtime hash"
+            exit 1
+          fi
+          if [ "$host_sha" != "$RUNTIME_HOST_SHA256" ]; then
+            echo "::error::bundled proot host does not match the official runtime hash"
+            exit 1
+          fi
+          echo "bundled runtime verified"
+
+          mkdir -p dist
+          cp "$apk" dist/CoomiDev-v1.4.8-full.apk
+          sha256sum dist/CoomiDev-v1.4.8-full.apk > dist/CoomiDev-v1.4.8-full.apk.sha256
+          {
+            echo "package=com.coomidev.android"
+            echo "label=CoomiDev"
+            echo "port=18765"
+            echo "apk_bytes=$apk_bytes"
+            echo "rootfs_sha256=$rootfs_sha"
+            echo "host_sha256=$host_sha"
+            echo "run=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          } > dist/BUILD.txt
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coomidev-v148-full-apk
+          path: |
+            dist/CoomiDev-v1.4.8-full.apk
+            dist/CoomiDev-v1.4.8-full.apk.sha256
+            dist/BUILD.txt
+          if-no-files-found: error
+
+      - name: Publish APK to GitHub Release
+        if: ${{ github.event_name == 'push' || inputs.publish_release == true }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag || 'coomidev-v1.4.8-full' }}
+          name: "CoomiDev v1.4.8 (full runtime)"
+          body: |
+            CoomiDev preview built from `${{ inputs.ref || github.ref_name }}` (run ${{ github.run_id }}).
+
+            - Package: `com.coomidev.android` (installs alongside the official Coomi)
+            - Application label: `CoomiDev`
+            - Default engine port: `18765`
+            - Bundles the official Runtime V2 environment (proot host + Ubuntu 24.04 ARM64 rootfs)
+            - Signed with a per-run preview keystore; uninstall an earlier preview if Android rejects an update
+          files: |
+            dist/CoomiDev-v1.4.8-full.apk
+            dist/CoomiDev-v1.4.8-full.apk.sha256
+            dist/BUILD.txt
+          fail_on_unmatched_files: true

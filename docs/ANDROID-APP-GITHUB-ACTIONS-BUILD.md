@@ -29,9 +29,13 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'          # AGP 要求
-      - uses: android-actions/setup-android@v3
+      - uses: android-actions/setup-android@v4   # v3 会因 tools 包下线失败，见失败台账 #9
       - name: Install Android platform
-        run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
+        run: |
+          set -euo pipefail
+          SDKMANAGER="$(find "${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}" -path '*/cmdline-tools/*/bin/sdkmanager' -type f | sort | tail -n 1)"
+          test -n "$SDKMANAGER"
+          sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
       - name: Build release APK
         run: ./gradlew --no-daemon --max-workers=2 :app:assembleRelease
       # ... 签名 + 验证 + 上传 + Release（见 §3）
@@ -43,14 +47,18 @@ jobs:
 
 - [ ] `runs-on` 用固定 `ubuntu-24.04`
 - [ ] Java 17（temurin）
+- [ ] **`android-actions/setup-android@v4`**（v3 已废弃，见失败台账 #9）
 - [ ] Android platform 35 + build-tools 35.0.0 显式安装
 - [ ] `./gradlew --no-daemon --max-workers=2`（限制并发防 OOM）
 - [ ] 签名 secrets 已配：`KEYSTORE_BASE64` / `KEYSTORE_PASSWORD` / `KEYSTORE_ALIAS` / `KEY_PASSWORD`
 - [ ] 项目如已有固定签名，先读项目签名资产文档；禁止因无法读取 Secret 明文而重新生成签名
+- [ ] **若 App 需内置离线运行时资产**：构建前先下载并校验 SHA256，放入 Gradle 期望的目录（见失败台账 #10）
+- [ ] **产物防废包**：体积下限断言 + 打开 APK 核对关键资产存在（见失败台账 #10）
 - [ ] 构建产物路径正确：`app/build/outputs/apk/release/*.apk`
 - [ ] `apksigner verify` 已加
 - [ ] 有 `if-no-files-found: error`（防静默失败）
 - [ ] 版本号与代码同步（⚠️ 见失败台账 #1）
+- [ ] workflow 若需手动触发，文件必须在**默认分支**上（见失败台账 #12）
 
 ---
 
@@ -89,6 +97,33 @@ jobs:
 
 ---
 
+## 4.1 内置离线运行时资产（Coomi 类 App 专用）
+
+适用：App 需把整套 Linux 运行时（PRoot host + rootfs）打进 APK，实现离线可用。
+
+**关键约束**：仓库 `.gitignore` 排除了 `runtime-v2-dist/`，构建产物里的环境**不会自动出现**。缺了它 APK 会小 300MB+，装上没有内置环境（失败台账 #10）。
+
+### 做法
+
+1. 把运行时资产托管到**固定 URL**（GitHub Release 或自有 CDN），便于 CI 复用。
+   - 本仓库实测可用：`mafucai/coomi-runtime-assets`（公开，从官方 APK 提取，SHA256 逐字节校验）
+2. 构建前下载 → **校验 SHA256 与大小** → 放进 Gradle 期望目录（Coomi 为 `runtime-v2-dist/`，文件名必须是 `proot-host-arm64.tar.gz` / `ubuntu-noble-arm64.tar.gz`）。
+3. Gradle 任务 `stageCoomiRuntimeV2` 会二次校验 size+sha256 并打进 APK；**校验不过会抛异常**，这是正确的保护，不要绕过。
+4. 构建后加**双重防废包闸门**：
+   - 体积断言：`apk_bytes >= 320000000`
+   - 内容断言：`unzip -p` 取出 APK 内 `assets/runtime-v2/*.tgz`，SHA256 必须等于官方值
+5. 参考实现：`mafucai/Coomi` 分支 `codex/coomidev-v148-full` 的 `.github/workflows/coomidev-v148-full.yml`
+   - 实测结果：355,302,525 字节（官方 355,310,063，差 7,538 字节），全流程 7 分 33 秒
+   - **反例**：同一项目历史上不经该步骤构建，产物仅 39MB，属废包
+
+### 不要做
+
+- 不要因校验失败就删掉校验或跳过 `stageCoomiRuntimeV2`
+- 不要把 300MB 级资产直接提交进 git（GitHub 单文件上限 100MB）
+- 不要把私有签名密钥放进 Runtime 资产仓库
+
+---
+
 ## 5. 失败台账（真实记录，持续更新）
 
 | # | 失败现象 | 根因 | 应对 |
@@ -101,6 +136,10 @@ jobs:
 | 6 | 真机"全部不通"但代理正常 | Java SOCKS 代理**本地解析 DNS**（域名被污染→假 IP→直连失败→全标 dead） | 探活改走 HTTP CONNECT（域名由内核远程解析）；**Java SOCKS ≠ 远程 DNS** |
 | 7 | 桥回调报 `[object Object] is not valid JSON` | 锁跨 20s 网络等待持锁 + `evaluateJavascript` 拼 JSON 无引号 | 网络等待零持锁；Java 侧 `quote()` 转义；**桥回调必须引号包裹，锁永不跨网络** |
 | 8 | "体检完成但已测 0" | 前端 `onDone` 不重拉数据 | 进度回调实时带结果 + `onDone` 重拉全量 |
+| 9 | 构建在 `Setup Android SDK` 步骤 30 秒失败：`Warning: Failed to find package 'tools'` → `sdkmanager failed with exit code 1` | `android-actions/setup-android@v3` 内部会 `sdkmanager tools`，而 Google 已不再提供 `tools` 包（该 action README 承认此问题，**v4 已修**：不再默认请求 `tools`，显式请求时只警告不失败） | **把 `setup-android` 固定为 `@v4`**；`sdkmanager` 用 `find ... \| sort \| tail -n1` 取最新版，取不到就显式报错 |
+| 10 | APK 只有 39MB，装上去没有内置环境（"废包"） | 构建只跑 `gradlew :app:assembleRelease`，未把 `runtime-v2-dist/` 的 proot host 与 rootfs 放进去；Gradle 任务 `stageCoomiRuntimeV2` 依赖该目录且含 size+sha256 硬校验，资产缺失时**若未被触发则静默出包** | **先下载 runtime 资产并校验 SHA256 再构建**；产物加**双重防废包闸门**：① APK ≥ 320000000 字节 ② 打开 APK 核对 `assets/runtime-v2/*.tgz` 的 SHA256 等于官方值 |
+| 11 | 签名口令缺失导致 Gradle 抛异常，或每次构建签名不同装不上 | `app/build.gradle` 的 `signingConfigs.debug` 从 `local.properties` 读 `coomi.signing.storePassword` / `keyPassword`，缺失即 `throw`；CI 里无该文件 | CI 中 `openssl rand -hex 16` 生成一次性口令 + `keytool -genkeypair` 造临时 keystore + 写 `local.properties`；**代价**：每次构建签名不同，装新版前需先卸载旧预览包 |
+| 12 | `workflow_dispatch` 报 `HTTP 404: Not Found`，无法手动触发 | GitHub 只索引**默认分支**上的 workflow 文件；新 workflow 若只存在于特性分支，则不在 dispatch 索引中 | 把 workflow 文件放到默认分支（main）后即可手动触发；或先靠 `on.push.branches` 触发一次 |
 
 ---
 
