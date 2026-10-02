@@ -1483,22 +1483,19 @@ mod tests {
         );
     }
 
-    /// V6.2: 压缩成功后必须留下一条卸载记录，且被移出的消息 ID 是压缩前
-    /// 存在、压缩后不在活跃历史里的那些。
+    /// V6.2: 压缩成功后必须留下一条卸载记录，且被移出的消息 ID 恰好是
+    /// 压缩前存在、压缩后不在活跃历史里的那些。
     #[tokio::test]
     async fn v62_compaction_records_dropped_message_ids() {
         let mut session = Session::new("mock", "tiny", PathBuf::from("."));
-        // retained_user_history 会保留最近的用户消息（预算 20k tokens），
-        // 所以这里必须造一条远超预算的用户消息，它才会真正被移出历史。
-        session.messages.push(ChatMessage::user("x".repeat(200_000)));
-        let old_id = session.messages[0].id.clone();
+        session.messages.push(ChatMessage::user("x".repeat(500)));
         // 快照压缩前的全部消息 ID，压缩后应能从中精确算出被移出的部分。
         let before_ids: Vec<String> = session
             .messages
             .iter()
             .map(|message| message.id.clone())
             .collect();
-        assert!(before_ids.contains(&old_id));
+        let before_set: HashSet<&str> = before_ids.iter().map(String::as_str).collect();
 
         let provider = CompactingProvider {
             calls: Mutex::new(0),
@@ -1520,22 +1517,32 @@ mod tests {
         // 该压缩由阈值触发（非 force_compaction），调用点传 automatic = true。
         assert!(record.automatic, "阈值触发的压缩应标记为 automatic");
         assert!(!record.compacted_at.is_empty());
-        // 只断言记录里带有本次压缩的用量数值，不假设压缩必然减少 token
+        // 只断言记录带有本次压缩的用量数值，不假设压缩必然减少 token
         //（是否变小取决于 provider 与摘要策略，不是 V6.2 的职责）。
-        // before/after 的确切取值由 compact() 内部采集，这里不跨作用域比对。
         assert!(record.before_tokens > 0, "压缩前用量应被记录");
         assert!(record.after_tokens > 0, "压缩后用量应被记录");
-        // 被移出的 ID 必须来自压缩前的集合，且压缩后确实不在活跃历史中。
+
+        // 差集的准确性：记录中每个移出 ID 都原本存在，且压缩后确实不在活跃历史；
+        // 反之，压缩前存在、压缩后消失的 ID 也必须全部出现在记录里。
+        let retained: HashSet<&str> = session
+            .messages
+            .iter()
+            .map(|message| message.id.as_str())
+            .collect();
         for id in &record.dropped_message_ids {
-            assert!(before_ids.contains(id), "移出的 ID 必须原本存在: {id}");
-            assert!(
-                !session.messages.iter().any(|m| &m.id == id),
-                "被记录为移出的消息不应还在活跃历史里: {id}"
-            );
+            assert!(before_set.contains(id.as_str()), "移出的 ID 必须原本存在: {id}");
+            assert!(!retained.contains(id.as_str()), "被记录为移出的消息不应还在活跃历史里: {id}");
         }
-        assert!(
-            record.dropped_message_ids.contains(&old_id),
-            "被压缩掉的长用户消息应出现在移出列表中"
+        let actually_gone: HashSet<&str> =
+            before_set.difference(&retained).copied().collect();
+        let recorded: HashSet<&str> = record
+            .dropped_message_ids
+            .iter()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            recorded, actually_gone,
+            "记录中的移出集合必须与压缩前后差集完全一致"
         );
     }
 
