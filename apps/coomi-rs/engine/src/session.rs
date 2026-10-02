@@ -67,6 +67,37 @@ pub struct Session {
     pub loop_state: Option<LoopState>,
     #[serde(default)]
     pub hooks_started: bool,
+    /// V6.1: 当前轮次的稳定 ID，同一轮重试/恢复不变，供记忆层幂等去重。
+    /// 只有真实用户轮次在开轮时生成；空串表示当前没有待归档的用户轮次。
+    #[serde(default)]
+    pub current_turn_id: String,
+    /// V6.1: 最后一个完整归档的轮次 ID。失败/取消/无最终回复的轮次不推进它。
+    #[serde(default)]
+    pub last_complete_turn: String,
+    /// V6.2: 压缩/卸载记录。每次压缩成功后追加一条，供记忆层与用户定位
+    /// 「被移出活跃历史的原文去哪找」。只做记录，不阻断压缩。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compaction_log: Vec<CompactionRecord>,
+}
+
+/// V6.2: 一次压缩的卸载记录。
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct CompactionRecord {
+    /// 压缩发生时间（UTC，RFC3339）。
+    pub compacted_at: String,
+    /// 手动(false) / 自动(true)。
+    pub automatic: bool,
+    /// 压缩前的活跃窗口 ID（可能为空：该会话尚未产生过窗口）。
+    pub window_id_before: String,
+    /// 压缩后的活跃窗口 ID。
+    pub window_id_after: String,
+    /// 压缩前的估算活跃 token。
+    pub before_tokens: u64,
+    /// 压缩后的估算活跃 token。
+    pub after_tokens: u64,
+    /// 被移出活跃模型历史的消息 ID（精确列表，按原顺序）。
+    /// 保留在活跃历史中的消息不在此列。
+    pub dropped_message_ids: Vec<String>,
 }
 
 impl Session {
@@ -91,6 +122,9 @@ impl Session {
             plan: None,
             loop_state: None,
             hooks_started: false,
+            current_turn_id: String::new(),
+            last_complete_turn: String::new(),
+            compaction_log: Vec::new(),
         }
     }
 
@@ -110,6 +144,12 @@ impl Session {
         self.loop_state = None;
         self.hooks_started = false;
         self.summary.clear();
+        // V6.1: 清空会话时一并清除轮次水位，避免遗留的 last_complete_turn
+        // 让记忆层误判该空会话仍存在可恢复的完整轮次。
+        self.current_turn_id.clear();
+        self.last_complete_turn.clear();
+        // V6.2: 会话数据被清空后，卸载记录引用的消息已不存在，一并清掉。
+        self.compaction_log.clear();
         self.touch();
     }
 
@@ -895,4 +935,138 @@ mod tests {
           assert_eq!(session.messages[0].content, "q1");
           assert_eq!(session.messages[1].content, "a1");
       }
-  }
+
+    // ---- V6.1 turn_commit 交付契约 ----
+
+    #[test]
+    fn v61_new_session_has_empty_turn_watermarks() {
+        let session = Session::new("provider", "model", PathBuf::from("/tmp"));
+        assert!(session.current_turn_id.is_empty());
+        assert!(session.last_complete_turn.is_empty());
+    }
+
+    #[test]
+    fn v61_turn_watermarks_survive_save_and_load() {
+        let home = tempfile::tempdir().expect("temporary home");
+        let store = SessionStore::new(home.path());
+        let mut session = Session::new("provider", "model", home.path().to_path_buf());
+        session.current_turn_id = "turn-abc".to_owned();
+        session.last_complete_turn = "turn-prev".to_owned();
+        store.save(&session).expect("save session");
+
+        let loaded = store.load(session.id).expect("load session");
+        assert_eq!(loaded.current_turn_id, "turn-abc");
+        assert_eq!(loaded.last_complete_turn, "turn-prev");
+    }
+
+    #[test]
+    fn v61_legacy_session_without_watermarks_still_loads() {
+        // T13: 旧会话文件没有 V6.1 字段，必须能反序列化且水位为空。
+        let home = tempfile::tempdir().expect("temporary home");
+        let store = SessionStore::new(home.path());
+        let session = Session::new("provider", "model", home.path().to_path_buf());
+        // 先正常落盘一次，保证写入路径与 store.load 的读取路径完全一致。
+        store.save(&session).expect("save session");
+
+        let path = home
+            .path()
+            .join("sessions")
+            .join(format!("{}.json", session.id));
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("read back")).expect("to value");
+        let object = value.as_object_mut().expect("session object");
+        // 模拟旧版本文件：V6.1 之前不存在这两个字段。
+        assert!(object.remove("current_turn_id").is_some());
+        assert!(object.remove("last_complete_turn").is_some());
+        fs::write(&path, serde_json::to_vec(&value).expect("encode")).expect("write legacy");
+
+        let loaded = store.load(session.id).expect("legacy session must load");
+        assert!(loaded.current_turn_id.is_empty());
+        assert!(loaded.last_complete_turn.is_empty());
+    }
+
+    #[test]
+    fn v61_clear_data_resets_turn_watermarks() {
+        let mut session = Session::new("provider", "model", PathBuf::from("/tmp"));
+        session.current_turn_id = "turn-abc".to_owned();
+        session.last_complete_turn = "turn-abc".to_owned();
+        session.clear_data();
+        assert!(
+            session.current_turn_id.is_empty() && session.last_complete_turn.is_empty(),
+            "clear_data must not leave stale turn watermarks behind"
+        );
+    }
+
+    // ---- V6.2 压缩/卸载记录 ----
+
+    #[test]
+    fn v62_new_session_has_empty_compaction_log() {
+        let session = Session::new("provider", "model", PathBuf::from("/tmp"));
+        assert!(session.compaction_log.is_empty());
+    }
+
+    #[test]
+    fn v62_compaction_log_survives_save_and_load() {
+        let home = tempfile::tempdir().expect("temporary home");
+        let store = SessionStore::new(home.path());
+        let mut session = Session::new("provider", "model", home.path().to_path_buf());
+        session.compaction_log.push(CompactionRecord {
+            compacted_at: "2026-10-02T08:00:00+00:00".to_owned(),
+            automatic: false,
+            window_id_before: "win-before".to_owned(),
+            window_id_after: "win-after".to_owned(),
+            before_tokens: 180_000,
+            after_tokens: 30_000,
+            dropped_message_ids: vec!["m1".to_owned(), "m2".to_owned()],
+        });
+        store.save(&session).expect("save session");
+
+        let loaded = store.load(session.id).expect("load session");
+        assert_eq!(loaded.compaction_log.len(), 1);
+        let record = &loaded.compaction_log[0];
+        assert!(!record.automatic);
+        assert_eq!(record.window_id_before, "win-before");
+        assert_eq!(record.window_id_after, "win-after");
+        assert_eq!(record.dropped_message_ids, vec!["m1", "m2"]);
+        assert_eq!(record.before_tokens, 180_000);
+        assert_eq!(record.after_tokens, 30_000);
+    }
+
+    #[test]
+    fn v62_legacy_session_without_compaction_log_still_loads() {
+        // T13: 旧会话文件没有 compaction_log 字段，必须仍能反序列化。
+        let home = tempfile::tempdir().expect("temporary home");
+        let store = SessionStore::new(home.path());
+        let session = Session::new("provider", "model", home.path().to_path_buf());
+        store.save(&session).expect("save session");
+
+        let path = home
+            .path()
+            .join("sessions")
+            .join(format!("{}.json", session.id));
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("read back")).expect("to value");
+        let object = value.as_object_mut().expect("session object");
+        object.remove("compaction_log");
+        fs::write(&path, serde_json::to_vec(&value).expect("encode")).expect("write legacy");
+
+        let loaded = store.load(session.id).expect("legacy session must load");
+        assert!(loaded.compaction_log.is_empty());
+    }
+
+    #[test]
+    fn v62_clear_data_resets_compaction_log() {
+        let mut session = Session::new("provider", "model", PathBuf::from("/tmp"));
+        session.compaction_log.push(CompactionRecord {
+            compacted_at: "2026-10-02T08:00:00+00:00".to_owned(),
+            automatic: true,
+            window_id_before: String::new(),
+            window_id_after: "win-after".to_owned(),
+            before_tokens: 1,
+            after_tokens: 2,
+            dropped_message_ids: Vec::new(),
+        });
+        session.clear_data();
+        assert!(session.compaction_log.is_empty());
+    }
+}

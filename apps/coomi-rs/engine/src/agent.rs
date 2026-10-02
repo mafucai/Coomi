@@ -17,6 +17,8 @@ use crate::ToolRuntime;
 use crate::TurnControl;
 use crate::compacted_history;
 use crate::normalize_history;
+use crate::CompactionRecord;
+use chrono::Utc;
 use crate::trim_history_to_fit;
 use crate::types::sanitize_json_encoded_data;
 use crate::types::sanitize_long_encoded_data;
@@ -29,6 +31,7 @@ use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::Semaphore;
+use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, Default)]
 struct ToolFailureState {
@@ -272,7 +275,7 @@ impl Agent {
         observer.on_event(&AgentEvent::ContextUpdated(
             session.context.status(&provider.capabilities()),
         ));
-        self.compact(session, provider, &tool_specs, observer, false)
+        self.compact(session, provider, &tool_specs, observer, false, tools)
             .await?;
         session.touch();
         self.run_checkpoint(session);
@@ -291,14 +294,68 @@ impl Agent {
         let usage_snapshot = session.usage.clone();
         let usage_before = usage_snapshot.total_tokens();
         let started = Instant::now();
+
+        // V6.1: 只有真实用户轮次才生成稳定 turn_id 与 user_text。
+        // internal 轮次（恢复指令、Loop 续跑）不得被当作用户发言归档。
+        let is_user_turn = !prompt.internal;
+        let user_text = if is_user_turn {
+            prompt.content.clone()
+        } else {
+            String::new()
+        };
+        if is_user_turn {
+            session.current_turn_id = Uuid::new_v4().to_string();
+        }
+        // internal 轮次没有自己的 turn_id；不能借用上一轮的 ID，否则记忆层
+        // 可能把恢复指令归档到错误的轮次上。
+        let turn_id = if is_user_turn {
+            session.current_turn_id.clone()
+        } else {
+            String::new()
+        };
+        // V6.3: 消息 ID 是 message_id → turn_id 映射的根基。用户消息 ID 在
+        // prompt 被消费前抓取；最终回复 ID 从落盘的 assistant 消息反查。
+        let user_message_id = prompt.id.clone();
+
         let mut result = self
             .run_turn_message(session, prompt, provider, tools, approval, observer)
             .await;
+
+        // V6.1: 交付实际展示给用户的最终回复；工具调用中途的草稿与工具输出不算。
+        let status = match &result {
+            Ok(_) => "success",
+            Err(_) => "failed",
+        };
+        let assistant_text = result.as_deref().unwrap_or("").to_string();
+        // 最终回复 = 会话里最后一条内容与展示回复一致的 assistant 消息；
+        // 失败轮/无最终回复时为空，不拿中间草稿充数。
+        let final_message_id = if result.is_ok() && !assistant_text.is_empty() {
+            session
+                .messages
+                .iter()
+                .rev()
+                .find(|message| {
+                    message.role == crate::Role::Assistant && message.content == assistant_text
+                })
+                .map(|message| message.id.clone())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+
         let lifecycle = tools
             .lifecycle(
                 "turn_end",
                 serde_json::json!({
+                    "schema_version": 1,
                     "session_id": session.id,
+                    "turn_id": turn_id,
+                    "is_user_turn": is_user_turn,
+                    "user_text": user_text,
+                    "assistant_text": assistant_text,
+                    "user_message_id": user_message_id,
+                    "final_message_id": final_message_id,
+                    "status": status,
                     "success": result.is_ok(),
                     "error": result.as_ref().err().map(ToString::to_string),
                 }),
@@ -310,6 +367,11 @@ impl Agent {
             }
             Err(error) if result.is_ok() => result = Err(AgentError::Hook(error)),
             _ => {}
+        }
+        // V6.1: 只有真实用户轮次且成功完成后，才推进最后完整轮次水位。
+        // 失败/取消/无最终回复的轮次不推进，供记忆层判断卸载安全边界。
+        if result.is_ok() && is_user_turn && !turn_id.is_empty() {
+            session.last_complete_turn = turn_id;
         }
         update_loop_accounting(
             session,
@@ -392,6 +454,7 @@ impl Agent {
                     &tool_specs,
                     observer,
                     !(self.force_compaction && round == 1),
+                    tools,
                 )
                 .await?;
             }
@@ -441,7 +504,7 @@ impl Agent {
                         if !compacted_for_provider_error && is_context_window_error(&error) =>
                     {
                         compacted_for_provider_error = true;
-                        self.compact(session, provider, &tool_specs, observer, true)
+                        self.compact(session, provider, &tool_specs, observer, true, tools)
                             .await?;
                         self.run_checkpoint(session);
                         continue 'tool_rounds;
@@ -709,8 +772,34 @@ impl Agent {
         tool_specs: &[crate::ToolSpec],
         observer: &dyn AgentObserver,
         automatic: bool,
+        tools: &dyn crate::ToolRuntime,
     ) -> Result<(), AgentError> {
         let before_tokens = session.context.estimated_active_tokens;
+        // V6.2: 压缩前抓快照，压缩后做差集，得到「被移出活跃历史的消息 ID」。
+        // 只做记录，不阻断压缩（产品取舍：手动压缩为主，不引入阻断）。
+        let window_id_before = session
+            .context
+            .window_id
+            .map_or_else(String::new, |id| id.to_string());
+        let before_ids: Vec<String> = session
+            .messages
+            .iter()
+            .map(|message| message.id.clone())
+            .collect();
+        // V6.3: 压缩前非阻断归档预警。钩子检查归档水位，但其失败/超时/deny
+        // 一律不阻断压缩（产品取舍：检查失败仍允许压缩，由 compaction_end
+        // 落 unverified/missing，不得称安全卸载）。
+        let _ = tools
+            .lifecycle(
+                "compaction_prepare",
+                serde_json::json!({
+                    "session_id": session.id,
+                    "message_count": before_ids.len(),
+                    "before_tokens": before_tokens,
+                    "automatic": automatic,
+                }),
+            )
+            .await;
         observer.on_event(&AgentEvent::CompactionStarted { automatic });
         let capabilities = provider.capabilities();
         let mut normalized = normalize_history(&session.messages);
@@ -798,6 +887,49 @@ impl Agent {
         );
         session.usage.add(&compact_usage);
         let status = session.context.status(&provider.capabilities());
+        // V6.2: 仅在压缩真正成功后落记录。差集按原顺序保留被移出的消息 ID，
+        // 供记忆层/用户定位「这段历史去哪了」。
+        let retained: HashSet<&str> = session
+            .messages
+            .iter()
+            .map(|message| message.id.as_str())
+            .collect();
+        let dropped_message_ids: Vec<String> = before_ids
+            .into_iter()
+            .filter(|id| !retained.contains(id.as_str()))
+            .collect();
+        let window_id_after = session
+            .context
+            .window_id
+            .map_or_else(String::new, |id| id.to_string());
+        session.compaction_log.push(CompactionRecord {
+            compacted_at: Utc::now().to_rfc3339(),
+            automatic,
+            window_id_before,
+            window_id_after,
+            before_tokens,
+            after_tokens: status.used_tokens,
+            dropped_message_ids,
+        });
+        // V6.3: 仅在压缩成功、V6.2 记录已落盘后发核验事件；携带实际移出的
+        // 消息 ID，供记忆层按 message_id → turn_id → 原文 核验/回载。
+        // 钩子失败不回滚记录也不阻断（事件是只读核验，V6.2 记录是事实源）。
+        let record = session.compaction_log.last().expect("record just pushed");
+        let _ = tools
+            .lifecycle(
+                "compaction_end",
+                serde_json::json!({
+                    "session_id": session.id,
+                    "compacted_at": record.compacted_at,
+                    "automatic": record.automatic,
+                    "window_id_before": record.window_id_before,
+                    "window_id_after": record.window_id_after,
+                    "before_tokens": record.before_tokens,
+                    "after_tokens": record.after_tokens,
+                    "dropped_message_ids": record.dropped_message_ids,
+                }),
+            )
+            .await;
         observer.on_event(&AgentEvent::CompactionCompleted {
             automatic,
             before_tokens,
@@ -1348,6 +1480,56 @@ mod tests {
                 .messages
                 .iter()
                 .any(|message| message.compaction_summary)
+        );
+    }
+
+    /// V6.2: 压缩成功后必须留下一条卸载记录，且被移出的消息 ID 是压缩前
+    /// 存在、压缩后不在活跃历史里的那些。
+    #[tokio::test]
+    async fn v62_compaction_records_dropped_message_ids() {
+        let mut session = Session::new("mock", "tiny", PathBuf::from("."));
+        session.messages.push(ChatMessage::user("x".repeat(500)));
+        let old_id = session.messages[0].id.clone();
+        // 快照压缩前的全部消息 ID，压缩后应能从中精确算出被移出的部分。
+        let before_ids: Vec<String> = session
+            .messages
+            .iter()
+            .map(|message| message.id.clone())
+            .collect();
+        assert!(before_ids.contains(&old_id));
+
+        let provider = CompactingProvider {
+            calls: Mutex::new(0),
+        };
+        Agent::new("test")
+            .run_turn(
+                &mut session,
+                "continue",
+                &provider,
+                &EchoTool,
+                &Approve,
+                &NoopObserver,
+            )
+            .await
+            .expect("compacted turn");
+
+        assert_eq!(session.compaction_log.len(), 1, "应记录一次压缩");
+        let record = &session.compaction_log[0];
+        // 该压缩由阈值触发（非 force_compaction），调用点传 automatic = true。
+        assert!(record.automatic, "阈值触发的压缩应标记为 automatic");
+        assert!(!record.compacted_at.is_empty());
+        assert!(record.before_tokens > record.after_tokens);
+        // 被移出的 ID 必须来自压缩前的集合，且压缩后确实不在活跃历史中。
+        for id in &record.dropped_message_ids {
+            assert!(before_ids.contains(id), "移出的 ID 必须原本存在: {id}");
+            assert!(
+                !session.messages.iter().any(|m| &m.id == id),
+                "被记录为移出的消息不应还在活跃历史里: {id}"
+            );
+        }
+        assert!(
+            record.dropped_message_ids.contains(&old_id),
+            "被压缩掉的长用户消息应出现在移出列表中"
         );
     }
 

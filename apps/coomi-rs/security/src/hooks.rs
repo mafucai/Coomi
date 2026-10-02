@@ -17,6 +17,10 @@ pub enum HookEvent {
     TurnEnd,
     PreToolUse,
     PostToolUse,
+    /// V6.3: 压缩前非阻断归档预警（检查失败不阻断压缩）。
+    CompactionPrepare,
+    /// V6.3: 压缩成功后携带 V6.2 移出消息 ID，供记忆层核验。
+    CompactionEnd,
 }
 
 impl HookEvent {
@@ -27,6 +31,8 @@ impl HookEvent {
             Self::TurnEnd => "turn_end",
             Self::PreToolUse => "pre_tool_use",
             Self::PostToolUse => "post_tool_use",
+            Self::CompactionPrepare => "compaction_prepare",
+            Self::CompactionEnd => "compaction_end",
         }
     }
 }
