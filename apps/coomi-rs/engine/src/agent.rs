@@ -275,7 +275,7 @@ impl Agent {
         observer.on_event(&AgentEvent::ContextUpdated(
             session.context.status(&provider.capabilities()),
         ));
-        self.compact(session, provider, &tool_specs, observer, false)
+        self.compact(session, provider, &tool_specs, observer, false, tools)
             .await?;
         session.touch();
         self.run_checkpoint(session);
@@ -313,6 +313,9 @@ impl Agent {
         } else {
             String::new()
         };
+        // V6.3: 消息 ID 是 message_id → turn_id 映射的根基。用户消息 ID 在
+        // prompt 被消费前抓取；最终回复 ID 从落盘的 assistant 消息反查。
+        let user_message_id = prompt.id.clone();
 
         let mut result = self
             .run_turn_message(session, prompt, provider, tools, approval, observer)
@@ -324,6 +327,21 @@ impl Agent {
             Err(_) => "failed",
         };
         let assistant_text = result.as_deref().unwrap_or("").to_string();
+        // 最终回复 = 会话里最后一条内容与展示回复一致的 assistant 消息；
+        // 失败轮/无最终回复时为空，不拿中间草稿充数。
+        let final_message_id = if result.is_ok() && !assistant_text.is_empty() {
+            session
+                .messages
+                .iter()
+                .rev()
+                .find(|message| {
+                    message.role == crate::Role::Assistant && message.content == assistant_text
+                })
+                .map(|message| message.id.clone())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
 
         let lifecycle = tools
             .lifecycle(
@@ -335,6 +353,8 @@ impl Agent {
                     "is_user_turn": is_user_turn,
                     "user_text": user_text,
                     "assistant_text": assistant_text,
+                    "user_message_id": user_message_id,
+                    "final_message_id": final_message_id,
                     "status": status,
                     "success": result.is_ok(),
                     "error": result.as_ref().err().map(ToString::to_string),
@@ -434,6 +454,7 @@ impl Agent {
                     &tool_specs,
                     observer,
                     !(self.force_compaction && round == 1),
+                    tools,
                 )
                 .await?;
             }
@@ -483,7 +504,7 @@ impl Agent {
                         if !compacted_for_provider_error && is_context_window_error(&error) =>
                     {
                         compacted_for_provider_error = true;
-                        self.compact(session, provider, &tool_specs, observer, true)
+                        self.compact(session, provider, &tool_specs, observer, true, tools)
                             .await?;
                         self.run_checkpoint(session);
                         continue 'tool_rounds;
@@ -751,6 +772,7 @@ impl Agent {
         tool_specs: &[crate::ToolSpec],
         observer: &dyn AgentObserver,
         automatic: bool,
+        tools: &dyn crate::ToolRuntime,
     ) -> Result<(), AgentError> {
         let before_tokens = session.context.estimated_active_tokens;
         // V6.2: 压缩前抓快照，压缩后做差集，得到「被移出活跃历史的消息 ID」。
@@ -764,6 +786,20 @@ impl Agent {
             .iter()
             .map(|message| message.id.clone())
             .collect();
+        // V6.3: 压缩前非阻断归档预警。钩子检查归档水位，但其失败/超时/deny
+        // 一律不阻断压缩（产品取舍：检查失败仍允许压缩，由 compaction_end
+        // 落 unverified/missing，不得称安全卸载）。
+        let _ = tools
+            .lifecycle(
+                "compaction_prepare",
+                serde_json::json!({
+                    "session_id": session.id,
+                    "message_count": before_ids.len(),
+                    "before_tokens": before_tokens,
+                    "automatic": automatic,
+                }),
+            )
+            .await;
         observer.on_event(&AgentEvent::CompactionStarted { automatic });
         let capabilities = provider.capabilities();
         let mut normalized = normalize_history(&session.messages);
@@ -859,6 +895,25 @@ impl Agent {
             after_tokens: status.used_tokens,
             dropped_message_ids,
         });
+        // V6.3: 仅在压缩成功、V6.2 记录已落盘后发核验事件；携带实际移出的
+        // 消息 ID，供记忆层按 message_id → turn_id → 原文 核验/回载。
+        // 钩子失败不回滚记录也不阻断（事件是只读核验，V6.2 记录是事实源）。
+        let record = session.compaction_log.last().expect("record just pushed");
+        let _ = tools
+            .lifecycle(
+                "compaction_end",
+                serde_json::json!({
+                    "session_id": session.id,
+                    "compacted_at": record.compacted_at,
+                    "automatic": record.automatic,
+                    "window_id_before": record.window_id_before,
+                    "window_id_after": record.window_id_after,
+                    "before_tokens": record.before_tokens,
+                    "after_tokens": record.after_tokens,
+                    "dropped_message_ids": record.dropped_message_ids,
+                }),
+            )
+            .await;
         observer.on_event(&AgentEvent::CompactionCompleted {
             automatic,
             before_tokens,

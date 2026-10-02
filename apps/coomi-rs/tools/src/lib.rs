@@ -2447,6 +2447,8 @@ impl ToolRuntime for CoreTools {
             "session_start" => HookEvent::SessionStart,
             "turn_start" => HookEvent::TurnStart,
             "turn_end" => HookEvent::TurnEnd,
+            "compaction_prepare" => HookEvent::CompactionPrepare,
+            "compaction_end" => HookEvent::CompactionEnd,
             other => return Err(format!("unknown hook lifecycle event: {other}")),
         };
         let outcome = hooks
