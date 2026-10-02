@@ -1488,7 +1488,9 @@ mod tests {
     #[tokio::test]
     async fn v62_compaction_records_dropped_message_ids() {
         let mut session = Session::new("mock", "tiny", PathBuf::from("."));
-        session.messages.push(ChatMessage::user("x".repeat(500)));
+        // retained_user_history 会保留最近的用户消息（预算 20k tokens），
+        // 所以这里必须造一条远超预算的用户消息，它才会真正被移出历史。
+        session.messages.push(ChatMessage::user("x".repeat(200_000)));
         let old_id = session.messages[0].id.clone();
         // 快照压缩前的全部消息 ID，压缩后应能从中精确算出被移出的部分。
         let before_ids: Vec<String> = session
