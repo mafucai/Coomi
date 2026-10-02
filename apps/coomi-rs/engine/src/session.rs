@@ -894,17 +894,20 @@ mod tests {
         let home = tempfile::tempdir().expect("temporary home");
         let store = SessionStore::new(home.path());
         let session = Session::new("provider", "model", home.path().to_path_buf());
+        // 先正常落盘一次，保证写入路径与 store.load 的读取路径完全一致。
+        store.save(&session).expect("save session");
+
+        let path = home
+            .path()
+            .join("sessions")
+            .join(format!("{}.json", session.id));
         let mut value: serde_json::Value =
-            serde_json::from_str(&serde_json::to_string(&session).expect("serialize"))
-                .expect("to value");
+            serde_json::from_slice(&fs::read(&path).expect("read back")).expect("to value");
         let object = value.as_object_mut().expect("session object");
-        object.remove("current_turn_id");
-        object.remove("last_complete_turn");
-        fs::write(
-            home.path().join(format!("{}.json", session.id)),
-            serde_json::to_vec(&value).expect("encode"),
-        )
-        .expect("write legacy session");
+        // 模拟旧版本文件：V6.1 之前不存在这两个字段。
+        assert!(object.remove("current_turn_id").is_some());
+        assert!(object.remove("last_complete_turn").is_some());
+        fs::write(&path, serde_json::to_vec(&value).expect("encode")).expect("write legacy");
 
         let loaded = store.load(session.id).expect("legacy session must load");
         assert!(loaded.current_turn_id.is_empty());
