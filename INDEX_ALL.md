@@ -474,7 +474,7 @@ bash /workspace/hooks/healthcheck.sh
 
 *最后更新：2026-09-16 · 覆盖 3 源 / 4 仓库 / 5 zip / 869+ 代码文件 / 41+ 文档 · 运行时项目 3 个（finance-v2 / novel-kg-compressor / 渐进式记忆）*
 
-### 2026-10-02 · 完整运行环境 APK 构建打通 + V6.1 交付契约（Ling）
+### 2026-10-02 · 完整运行环境 APK 构建打通 + V6.1 交付契约 + V6.2 卸载记录（Ling）
 
 | 变更 | 内容 | 位置 |
 |---|---|---|
@@ -484,6 +484,10 @@ bash /workspace/hooks/healthcheck.sh
 | **反例：39MB 废包** | 缺 `runtime-v2-dist/` 时产 39MB 包，装上无内置环境 | 失败台账 #10 |
 | **V6.1 交付契约** | `turn_end` 载荷补 `schema_version`/`turn_id`/`is_user_turn`/`user_text`/`assistant_text`/`status`；`Session` 新增 `current_turn_id`、`last_complete_turn`（均 `serde(default)` 兼容旧会话） | `apps/coomi-rs/engine/src/{agent.rs,session.rs}` |
 | **V6.1 CI 全绿** | `cargo test -p coomi-engine`：**61 passed / 0 failed**（含 4 个新增 V6.1 测试） | 分支 `feat/v6.1-turn-commit`，run `36969194795` |
+| **V6.2 压缩/卸载记录** | 每次压缩成功后追加一条 `CompactionRecord`：时间、手动/自动、压缩前后 `window_id`、前后 token、**被移出的消息 ID 精确列表**。压缩仍是整体替换，记录用压缩前后消息 ID 差集得出 | `session.rs` / `agent.rs`（`compact()`）|
+| **V6.2 只记账不阻断** | 产品取舍：保持「不阻断聊天」，卸载范围标记为**已记录、未校验**；不因记忆层不可用而拒绝压缩 | 见 V6 文档 §3.2 |
+| **V6.2 CI 全绿** | `cargo test -p coomi-engine`：**66 passed / 0 failed**（含 5 个新增 V6.2 测试：差集/存盘/旧文件兼容/清空重置/初始化） | run `36986812872` |
+| **V6.2 未做** | `compaction_prepare` 归档校验（V6 文档 §3.2 前半）**未实现**；手动压缩 + 人工提前提醒已满足当前需求 | — |
 | **新增 Rust CI** | 轻量 engine 编译/测试闸门；fmt/clippy 设为提示性 | `.github/workflows/rust-ci.yml` |
 | **V6 设计标准** | 三事件契约 + 幂等/崩溃补交/隐私边界 + **T01–T13 验收矩阵** | `novel-kg-compressor/docs/V6-ARCHITECTURE.md` |
 
@@ -493,4 +497,4 @@ bash /workspace/hooks/healthcheck.sh
 
 ---
 
-*最后更新：2026-10-02 · 新增 §8 完整运行环境 APK 构建 + V6.1；更正 V5 结论 · 索引三副本互指已建立*
+*最后更新：2026-10-02 · 新增 §8 完整运行环境 APK 构建 + V6.1 交付契约 + V6.2 卸载记录；更正 V5 结论 · 索引三副本互指已建立*
