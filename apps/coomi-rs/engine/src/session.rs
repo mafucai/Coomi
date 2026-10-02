@@ -64,6 +64,13 @@ pub struct Session {
     pub loop_state: Option<LoopState>,
     #[serde(default)]
     pub hooks_started: bool,
+    /// V6.1: 当前轮次的稳定 ID，同一轮重试/恢复不变，供记忆层幂等去重。
+    /// 只有真实用户轮次在开轮时生成；空串表示当前没有待归档的用户轮次。
+    #[serde(default)]
+    pub current_turn_id: String,
+    /// V6.1: 最后一个完整归档的轮次 ID。失败/取消/无最终回复的轮次不推进它。
+    #[serde(default)]
+    pub last_complete_turn: String,
 }
 
 impl Session {
@@ -87,6 +94,8 @@ impl Session {
             plan: None,
             loop_state: None,
             hooks_started: false,
+            current_turn_id: String::new(),
+            last_complete_turn: String::new(),
         }
     }
 
@@ -106,6 +115,10 @@ impl Session {
         self.loop_state = None;
         self.hooks_started = false;
         self.summary.clear();
+        // V6.1: 清空会话时一并清除轮次水位，避免遗留的 last_complete_turn
+        // 让记忆层误判该空会话仍存在可恢复的完整轮次。
+        self.current_turn_id.clear();
+        self.last_complete_turn.clear();
         self.touch();
     }
 
@@ -851,4 +864,62 @@ mod tests {
           assert_eq!(session.messages[0].content, "q1");
           assert_eq!(session.messages[1].content, "a1");
       }
-  }
+
+    // ---- V6.1 turn_commit 交付契约 ----
+
+    #[test]
+    fn v61_new_session_has_empty_turn_watermarks() {
+        let session = Session::new("provider", "model", PathBuf::from("/tmp"));
+        assert!(session.current_turn_id.is_empty());
+        assert!(session.last_complete_turn.is_empty());
+    }
+
+    #[test]
+    fn v61_turn_watermarks_survive_save_and_load() {
+        let home = tempfile::tempdir().expect("temporary home");
+        let store = SessionStore::new(home.path());
+        let mut session = Session::new("provider", "model", home.path().to_path_buf());
+        session.current_turn_id = "turn-abc".to_owned();
+        session.last_complete_turn = "turn-prev".to_owned();
+        store.save(&session).expect("save session");
+
+        let loaded = store.load(session.id).expect("load session");
+        assert_eq!(loaded.current_turn_id, "turn-abc");
+        assert_eq!(loaded.last_complete_turn, "turn-prev");
+    }
+
+    #[test]
+    fn v61_legacy_session_without_watermarks_still_loads() {
+        // T13: 旧会话文件没有 V6.1 字段，必须能反序列化且水位为空。
+        let home = tempfile::tempdir().expect("temporary home");
+        let store = SessionStore::new(home.path());
+        let session = Session::new("provider", "model", home.path().to_path_buf());
+        let mut value: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&session).expect("serialize"))
+                .expect("to value");
+        let object = value.as_object_mut().expect("session object");
+        object.remove("current_turn_id");
+        object.remove("last_complete_turn");
+        fs::write(
+            home.path().join(format!("{}.json", session.id)),
+            serde_json::to_vec(&value).expect("encode"),
+        )
+        .expect("write legacy session");
+
+        let loaded = store.load(session.id).expect("legacy session must load");
+        assert!(loaded.current_turn_id.is_empty());
+        assert!(loaded.last_complete_turn.is_empty());
+    }
+
+    #[test]
+    fn v61_clear_data_resets_turn_watermarks() {
+        let mut session = Session::new("provider", "model", PathBuf::from("/tmp"));
+        session.current_turn_id = "turn-abc".to_owned();
+        session.last_complete_turn = "turn-abc".to_owned();
+        session.clear_data();
+        assert!(
+            session.current_turn_id.is_empty() && session.last_complete_turn.is_empty(),
+            "clear_data must not leave stale turn watermarks behind"
+        );
+    }
+}

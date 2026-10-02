@@ -1,0 +1,51 @@
+name: Rust CI (engine)
+
+# 轻量编译/测试闸门：只验证 Rust 代码，不构建 APK。
+# 本地无 Rust 工具链，所有编译验证都在这里跑。
+on:
+  push:
+    paths:
+      - "apps/coomi-rs/**"
+      - ".github/workflows/rust-ci.yml"
+  pull_request:
+    paths:
+      - "apps/coomi-rs/**"
+  workflow_dispatch:
+
+concurrency:
+  group: rust-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: apps/coomi-rs
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 与 APK 构建工作流保持一致的工具链版本，避免版本漂移。
+      - name: Setup Rust 1.95.0
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/coomi-rs
+
+      - name: Format check (informational)
+        # 仓库历史代码存在 rustfmt 未覆盖的格式，这里只做提示，不阻塞 CI。
+        # 硬阻塞会让 V6.1 的编译/测试验证被无关的历史格式问题挡住。
+        run: cargo fmt --all -- --check
+        continue-on-error: true
+
+      - name: Clippy (engine)
+        run: cargo clippy -p coomi-engine --all-targets -- -D warnings
+
+      - name: Test (engine)
+        run: cargo test -p coomi-engine

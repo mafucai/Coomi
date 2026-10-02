@@ -29,6 +29,7 @@ use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::Semaphore;
+use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, Default)]
 struct ToolFailureState {
@@ -291,14 +292,48 @@ impl Agent {
         let usage_snapshot = session.usage.clone();
         let usage_before = usage_snapshot.total_tokens();
         let started = Instant::now();
+
+        // V6.1: 只有真实用户轮次才生成稳定 turn_id 与 user_text。
+        // internal 轮次（恢复指令、Loop 续跑）不得被当作用户发言归档。
+        let is_user_turn = !prompt.internal;
+        let user_text = if is_user_turn {
+            prompt.content.clone()
+        } else {
+            String::new()
+        };
+        if is_user_turn {
+            session.current_turn_id = Uuid::new_v4().to_string();
+        }
+        // internal 轮次没有自己的 turn_id；不能借用上一轮的 ID，否则记忆层
+        // 可能把恢复指令归档到错误的轮次上。
+        let turn_id = if is_user_turn {
+            session.current_turn_id.clone()
+        } else {
+            String::new()
+        };
+
         let mut result = self
             .run_turn_message(session, prompt, provider, tools, approval, observer)
             .await;
+
+        // V6.1: 交付实际展示给用户的最终回复；工具调用中途的草稿与工具输出不算。
+        let status = match &result {
+            Ok(_) => "success",
+            Err(_) => "failed",
+        };
+        let assistant_text = result.as_deref().unwrap_or("").to_string();
+
         let lifecycle = tools
             .lifecycle(
                 "turn_end",
                 serde_json::json!({
+                    "schema_version": 1,
                     "session_id": session.id,
+                    "turn_id": turn_id,
+                    "is_user_turn": is_user_turn,
+                    "user_text": user_text,
+                    "assistant_text": assistant_text,
+                    "status": status,
                     "success": result.is_ok(),
                     "error": result.as_ref().err().map(ToString::to_string),
                 }),
@@ -310,6 +345,11 @@ impl Agent {
             }
             Err(error) if result.is_ok() => result = Err(AgentError::Hook(error)),
             _ => {}
+        }
+        // V6.1: 只有真实用户轮次且成功完成后，才推进最后完整轮次水位。
+        // 失败/取消/无最终回复的轮次不推进，供记忆层判断卸载安全边界。
+        if result.is_ok() && is_user_turn && !turn_id.is_empty() {
+            session.last_complete_turn = turn_id;
         }
         update_loop_accounting(
             session,
