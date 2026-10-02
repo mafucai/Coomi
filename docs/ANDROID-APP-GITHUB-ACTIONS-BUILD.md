@@ -68,22 +68,30 @@ jobs:
 - name: Sign release APK
   env:
     KEYSTORE_B64: ${{ secrets.KEYSTORE_BASE64 }}
-    KEYSTORE_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+    STORE_PASS: ${{ secrets.KEYSTORE_PASSWORD }}    # ← 独立 secret：keystore 密码
+    KEY_PASS: ${{ secrets.KEY_PASSWORD }}          # ← 独立 secret：key password（重要！不可与 store pass 混用）
     KEYSTORE_ALIAS_NAME: ${{ secrets.KEYSTORE_ALIAS }}
   run: |
     set -euo pipefail
+    trap 'rm -f release-fixed.jks SIGNED.apk.tmp' EXIT  # ← 失败也清理，不遗留密钥文件
     SDK_BUILD_TOOLS="${ANDROID_HOME}/build-tools/35.0.0"
     echo -n "${KEYSTORE_B64}" | base64 -d > release-fixed.jks
-    test -s release-fixed.jks                      # 空包立即失败
+    test -s release-fixed.jks
     UNSIGNED="app/build/outputs/apk/release/app-release-unsigned.apk"
     test -f "${UNSIGNED}"
     "${SDK_BUILD_TOOLS}/apksigner" sign \
-      --ks release-fixed.jks --ks-pass "pass:${KEYSTORE_PASS}" \
+      --ks release-fixed.jks \
+      --ks-pass "pass:${STORE_PASS}" \
       --ks-key-alias "${KEYSTORE_ALIAS_NAME}" \
-      --key-pass "pass:${KEYSTORE_PASS}" --out SIGNED.apk "${UNSIGNED}"
-    "${SDK_BUILD_TOOLS}/apksigner" verify SIGNED.apk      # 必验
-    rm -f release-fixed.jks                               # 清密钥
+      --key-pass "pass:${KEY_PASS}" \
+      --out SIGNED.apk.tmp "${UNSIGNED}"
+    mv SIGNED.apk.tmp SIGNED.apk
+    "${SDK_BUILD_TOOLS}/apksigner" verify SIGNED.apk
 ```
+
+> ⚠️ **两个密码必须分开**：`KEYSTORE_PASSWORD`（keystore 库口令）与 `KEY_PASSWORD`（key 口令）在 `keytool` 里本就独立。
+> 若把 `--key-pass` 也填成 store 口令，遇到"库口令 ≠ key 口令"的 keystore 会**签名失败**。
+> `trap ... EXIT` 保证**失败路径也清理** `release-fixed.jks`（内含私钥），不能让它在 runner 上残留。
 
 ---
 

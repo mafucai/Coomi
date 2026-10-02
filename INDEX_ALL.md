@@ -9,6 +9,13 @@
 > 例如 `Coomi/README.md` 的完整路径是 **`/workspace/repos/Coomi/README.md`**。
 > 本地 zip / inbox 路径相对 **`/workspace/inbox/`**；运行时资产（finance-v2/、rules/、hooks/、渐进式记忆/、novel-kg-compressor/）在 **`/workspace/`**。
 
+> 📍 **本索引共有三份副本**（内容可能不同步，以**最近修改时间最新**的为准）：
+> 1. `/workspace/inbox/INDEX_ALL.md` — 主副本，最全
+> 2. `/workspace/repos/Coomi/INDEX_ALL.md` — 随 Coomi 仓库
+> 3. `/home/coomi/Coomi/INDEX_ALL.md` — Coomi 工作克隆（本文件）
+> 三份各有 `.bak-<日期>-<用途>` 备份，改前先备份。
+> ⚠️ 本副本较旧（缺 §2.1b、§2.5b、§6.5 及 2026-09-22 起全部变更记录），**如需完整信息请读主副本**。
+
 ---
 
 ## 0. 最快上手（30 秒版）
@@ -369,7 +376,7 @@ futures-terminal/.github/workflows/apk.yml ✅
 | 文档 | 校准后状态 | 实际路径 |
 |---|---|---|
 | App 模板化流程 | ✅ 存在（4.1K） | `/workspace/repos/Coomi/docs/APP-TEMPLATE-GITHUB-ACTIONS.md` |
-| 构建坑清单 | ✅ 存在（5.1K） | `/workspace/repos/Coomi/docs/ANDROID-APP-GITHUB-ACTIONS-BUILD.md` |
+| 构建坑清单 | ✅ 存在（**10.4K，2026-10-02 更新：含 §4.1 内置离线运行时资产 + 台账 #9–#12**） | `/workspace/repos/Coomi/docs/ANDROID-APP-GITHUB-ACTIONS-BUILD.md` |
 | 自制备份格式规范 | ✅ 存在（3.1K） | `/workspace/repos/Coomi/docs/COOMI-BACKUP-FORMAT.md` |
 | 规则全文 full-rules | ✅ 已部署 | `/workspace/rules/full-rules.md` |
 | 精简规则 slim | ✅ 已部署 | `/workspace/rules/custom-prompt-v3-slim.md` |
@@ -466,3 +473,24 @@ bash /workspace/hooks/healthcheck.sh
 ---
 
 *最后更新：2026-09-16 · 覆盖 3 源 / 4 仓库 / 5 zip / 869+ 代码文件 / 41+ 文档 · 运行时项目 3 个（finance-v2 / novel-kg-compressor / 渐进式记忆）*
+
+### 2026-10-02 · 完整运行环境 APK 构建打通 + V6.1 交付契约（Ling）
+
+| 变更 | 内容 | 位置 |
+|---|---|---|
+| **⭐ 完整 CoomiDev APK 构建打通** | 含官方 Runtime V2 内置环境；产物 **355,302,525 字节**（官方 355,310,063，差 7,538）；全流程 **7 分 33 秒** | run `36903953543`，分支 `codex/coomidev-v148-full` |
+| **运行时资产公开托管** | 从官方 APK 提取 host+rootfs，SHA256 逐字节校验后上传公开 Release 供 CI 复用 | `mafucai/coomi-runtime-assets` @ `runtime-v2-ubuntu-noble-20260907` |
+| **双重防废包闸门** | ①体积断言 `apk >= 320,000,000`；②内容断言：APK 内 `assets/runtime-v2/*.tgz` SHA256 必须等于官方值 | `.github/workflows/coomidev-v148-full.yml` |
+| **反例：39MB 废包** | 缺 `runtime-v2-dist/` 时产 39MB 包，装上无内置环境 | 失败台账 #10 |
+| **V6.1 交付契约** | `turn_end` 载荷补 `schema_version`/`turn_id`/`is_user_turn`/`user_text`/`assistant_text`/`status`；`Session` 新增 `current_turn_id`、`last_complete_turn`（均 `serde(default)` 兼容旧会话） | `apps/coomi-rs/engine/src/{agent.rs,session.rs}` |
+| **V6.1 CI 全绿** | `cargo test -p coomi-engine`：**61 passed / 0 failed**（含 4 个新增 V6.1 测试） | 分支 `feat/v6.1-turn-commit`，run `36969194795` |
+| **新增 Rust CI** | 轻量 engine 编译/测试闸门；fmt/clippy 设为提示性 | `.github/workflows/rust-ci.yml` |
+| **V6 设计标准** | 三事件契约 + 幂等/崩溃补交/隐私边界 + **T01–T13 验收矩阵** | `novel-kg-compressor/docs/V6-ARCHITECTURE.md` |
+
+> ⚠️ **同时更正一条旧结论**：先前记录的「V5 真实端到端已通过」经 2026-10-02 实测**不成立** ——
+> `dialogues/` 下 8 个 `v5-*` 目录**全为空**，`writeTurn` 从未成功执行；索引内路径被写成**不存在的宿主路径**，
+> 钩子每轮静默走 `no-memory-log mode=v5`。「目录已创建」≠「归档可用」。
+
+---
+
+*最后更新：2026-10-02 · 新增 §8 完整运行环境 APK 构建 + V6.1；更正 V5 结论 · 索引三副本互指已建立*
