@@ -17,6 +17,8 @@ use crate::ToolRuntime;
 use crate::TurnControl;
 use crate::compacted_history;
 use crate::normalize_history;
+use crate::CompactionRecord;
+use chrono::Utc;
 use crate::trim_history_to_fit;
 use crate::types::sanitize_json_encoded_data;
 use crate::types::sanitize_long_encoded_data;
@@ -751,6 +753,17 @@ impl Agent {
         automatic: bool,
     ) -> Result<(), AgentError> {
         let before_tokens = session.context.estimated_active_tokens;
+        // V6.2: 压缩前抓快照，压缩后做差集，得到「被移出活跃历史的消息 ID」。
+        // 只做记录，不阻断压缩（产品取舍：手动压缩为主，不引入阻断）。
+        let window_id_before = session
+            .context
+            .window_id
+            .map_or_else(String::new, |id| id.to_string());
+        let before_ids: Vec<String> = session
+            .messages
+            .iter()
+            .map(|message| message.id.clone())
+            .collect();
         observer.on_event(&AgentEvent::CompactionStarted { automatic });
         let capabilities = provider.capabilities();
         let mut normalized = normalize_history(&session.messages);
@@ -822,6 +835,30 @@ impl Agent {
         );
         session.usage.add(&compact_usage);
         let status = session.context.status(&provider.capabilities());
+        // V6.2: 仅在压缩真正成功后落记录。差集按原顺序保留被移出的消息 ID，
+        // 供记忆层/用户定位「这段历史去哪了」。
+        let retained: HashSet<&str> = session
+            .messages
+            .iter()
+            .map(|message| message.id.as_str())
+            .collect();
+        let dropped_message_ids: Vec<String> = before_ids
+            .into_iter()
+            .filter(|id| !retained.contains(id.as_str()))
+            .collect();
+        let window_id_after = session
+            .context
+            .window_id
+            .map_or_else(String::new, |id| id.to_string());
+        session.compaction_log.push(CompactionRecord {
+            compacted_at: Utc::now().to_rfc3339(),
+            automatic,
+            window_id_before,
+            window_id_after,
+            before_tokens,
+            after_tokens: status.used_tokens,
+            dropped_message_ids,
+        });
         observer.on_event(&AgentEvent::CompactionCompleted {
             automatic,
             before_tokens,
@@ -1372,6 +1409,56 @@ mod tests {
                 .messages
                 .iter()
                 .any(|message| message.compaction_summary)
+        );
+    }
+
+    /// V6.2: 压缩成功后必须留下一条卸载记录，且被移出的消息 ID 是压缩前
+    /// 存在、压缩后不在活跃历史里的那些。
+    #[tokio::test]
+    async fn v62_compaction_records_dropped_message_ids() {
+        let mut session = Session::new("mock", "tiny", PathBuf::from("."));
+        session.messages.push(ChatMessage::user("x".repeat(500)));
+        let old_id = session.messages[0].id.clone();
+        // 快照压缩前的全部消息 ID，压缩后应能从中精确算出被移出的部分。
+        let before_ids: Vec<String> = session
+            .messages
+            .iter()
+            .map(|message| message.id.clone())
+            .collect();
+        assert!(before_ids.contains(&old_id));
+
+        let provider = CompactingProvider {
+            calls: Mutex::new(0),
+        };
+        Agent::new("test")
+            .run_turn(
+                &mut session,
+                "continue",
+                &provider,
+                &EchoTool,
+                &Approve,
+                &NoopObserver,
+            )
+            .await
+            .expect("compacted turn");
+
+        assert_eq!(session.compaction_log.len(), 1, "应记录一次压缩");
+        let record = &session.compaction_log[0];
+        // 该压缩由阈值触发（非 force_compaction），调用点传 automatic = true。
+        assert!(record.automatic, "阈值触发的压缩应标记为 automatic");
+        assert!(!record.compacted_at.is_empty());
+        assert!(record.before_tokens > record.after_tokens);
+        // 被移出的 ID 必须来自压缩前的集合，且压缩后确实不在活跃历史中。
+        for id in &record.dropped_message_ids {
+            assert!(before_ids.contains(id), "移出的 ID 必须原本存在: {id}");
+            assert!(
+                !session.messages.iter().any(|m| &m.id == id),
+                "被记录为移出的消息不应还在活跃历史里: {id}"
+            );
+        }
+        assert!(
+            record.dropped_message_ids.contains(&old_id),
+            "被压缩掉的长用户消息应出现在移出列表中"
         );
     }
 

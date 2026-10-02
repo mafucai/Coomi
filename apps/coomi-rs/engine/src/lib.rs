@@ -20,6 +20,7 @@ pub use context::trim_history_to_fit;
 pub use input_queue::InputQueue;
 pub use instructions::discover_project_instructions;
 pub use session::Session;
+pub use session::CompactionRecord;
 pub use session::SessionMode;
 pub use session::SessionStore;
 pub use session::SessionSummary;
