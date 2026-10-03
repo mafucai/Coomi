@@ -9,7 +9,7 @@ name: CoomiDev APK (v1.4.8, full runtime)
 
 on:
   push:
-    branches: [codex/coomidev-v148-full]
+    branches: [codex/coomidev-v148-full, feat/v6.4-recovery-is-failure]
     paths:
       - ".github/workflows/coomidev-v148-full.yml"
       - "apps/**"
@@ -149,9 +149,10 @@ jobs:
           check runtime-v2-dist/ubuntu-noble-arm64.tar.gz "$RUNTIME_ROOTFS_SHA256" "$RUNTIME_ROOTFS_SIZE"
           echo "runtime assets verified"
 
-      # 固定正式签名（与 futures-terminal 共用同一签名资产，见
-      # repos/futures-terminal/docs/ANDROID_SIGNING.md）。
-      # 禁止重新生成签名替换现有签名；读不到 Secret 明文时不得创建新签名。
+      # 固定正式签名（Coomi 专用签名资产，2026-10-03 首次启用）。
+      # 该仓库此前每次构建都用 openssl rand 现生成 keystore，签名不稳定、无法覆盖安装。
+      # 首次启用固定签名，不涉及替换任何既有签名。详见 docs/ANDROID_SIGNING.md。
+      # 禁止在缺少 Secret 时回退为临时随机签名。
       - name: Restore fixed signing keystore
         env:
           KEYSTORE_B64: ${{ secrets.KEYSTORE_BASE64 }}
@@ -237,7 +238,7 @@ jobs:
             SIGNER_SHA256="$(echo "$CERT_OUT" | grep -m1 -oE '([0-9A-F]{2}:){31}[0-9A-F]{2}')"
           fi
           echo "signer_sha256=$SIGNER_SHA256"
-          EXPECTED_SIGNER_SHA256="15:32:B4:21:35:16:65:64:EA:C8:DE:F1:8E:AA:89:8D:F6:E7:17:93:70:82:90:F6:84:6F:D6:C2:77:1F:2B:17"
+          EXPECTED_SIGNER_SHA256="D7:1B:76:59:19:8C:E2:91:D7:D9:B8:0E:90:46:FB:60:9E:7D:43:4E:62:18:E7:E4:E0:84:94:7A:40:AC:0A:13"
           if ! echo "$SIGNER_SHA256" | grep -qi "^${EXPECTED_SIGNER_SHA256}$"; then
             echo "::error::APK 签名证书指纹与固定签名资产不一致。"
             echo "::error::expected=$EXPECTED_SIGNER_SHA256"
