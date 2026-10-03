@@ -149,22 +149,51 @@ jobs:
           check runtime-v2-dist/ubuntu-noble-arm64.tar.gz "$RUNTIME_ROOTFS_SHA256" "$RUNTIME_ROOTFS_SIZE"
           echo "runtime assets verified"
 
-      - name: Write signing properties
+      # 固定正式签名（与 futures-terminal 共用同一签名资产，见
+      # repos/futures-terminal/docs/ANDROID_SIGNING.md）。
+      # 禁止重新生成签名替换现有签名；读不到 Secret 明文时不得创建新签名。
+      - name: Restore fixed signing keystore
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEYSTORE_ALIAS_NAME: ${{ secrets.KEYSTORE_ALIAS }}
+          KEY_PASS: ${{ secrets.KEY_PASSWORD }}
         run: |
           set -euo pipefail
-          PASS="$(openssl rand -hex 16)"
+          if [ -z "${KEYSTORE_B64:-}" ]; then
+            echo "::error::KEYSTORE_BASE64 未配置。固定签名需要仓库 Secrets："
+            echo "::error::KEYSTORE_BASE64 / KEYSTORE_PASSWORD / KEYSTORE_ALIAS / KEY_PASSWORD"
+            echo "::error::禁止改为临时随机签名（见 docs/ANDROID_SIGNING.md 第 3 节）。"
+            exit 1
+          fi
+          if [ -z "${KEYSTORE_ALIAS_NAME:-}" ]; then
+            echo "::error::KEYSTORE_ALIAS 未配置。"
+            exit 1
+          fi
+
+          # 1) 解码固定 keystore 到 Gradle 期望的资产路径
           rm -f apps/coomi-app/app/testkey_untrusted.jks
-          keytool -genkeypair \
-            -keystore apps/coomi-app/app/testkey_untrusted.jks \
-            -alias alias -keyalg RSA -keysize 2048 -validity 3650 \
-            -storepass "$PASS" -keypass "$PASS" \
-            -dname "CN=CoomiDev Preview, OU=Preview, O=Coomi, L=Local, ST=NA, C=CN"
+          echo -n "${KEYSTORE_B64}" | base64 -d > apps/coomi-app/app/testkey_untrusted.jks
+          test -s apps/coomi-app/app/testkey_untrusted.jks
+
+          # 2) 口令与别名写入 local.properties（该文件已被 .gitignore 排除，不入库）
           {
-            echo "sdk.dir=$ANDROID_SDK_ROOT"
-            echo "coomi.signing.storePassword=$PASS"
-            echo "coomi.signing.keyPassword=$PASS"
+            echo "sdk.dir=${ANDROID_SDK_ROOT}"
+            echo "coomi.signing.storePassword=${KEYSTORE_PASS}"
+            echo "coomi.signing.keyPassword=${KEY_PASS:-${KEYSTORE_PASS}}"
+            echo "coomi.signing.keyAlias=${KEYSTORE_ALIAS_NAME}"
           } > local.properties
-          echo "per-run preview signing key generated"
+
+          # 3) 立即核对 keystore 内的别名与证书指纹，早失败、不猜
+          echo "=== keystore 别名清单 ==="
+          keytool -list -keystore apps/coomi-app/app/testkey_untrusted.jks \
+            -storepass "${KEYSTORE_PASS}" | sed -n '1,40p'
+          if ! keytool -list -keystore apps/coomi-app/app/testkey_untrusted.jks \
+              -storepass "${KEYSTORE_PASS}" | grep -q "${KEYSTORE_ALIAS_NAME}"; then
+            echo "::error::keystore 中不存在别名 ${KEYSTORE_ALIAS_NAME}；请核对 KEYSTORE_ALIAS。"
+            exit 1
+          fi
+          echo "固定签名已就绪（alias=${KEYSTORE_ALIAS_NAME}）"
 
       - name: Assemble CoomiDev APK
         run: |
@@ -193,6 +222,30 @@ jobs:
 
           # 2) Signature
           "$BUILD_TOOLS/apksigner" verify --verbose "$apk"
+
+          # 2b) 固定签名核对：证书 SHA-256 必须与共用签名资产一致
+          #     （futures-terminal/docs/ANDROID_SIGNING.md 第 1 节）。
+          #     签名不符说明用错了 keystore，会导致已安装用户无法覆盖升级，必须硬失败。
+          CERT_OUT="$("$BUILD_TOOLS/apksigner" verify --print-certs "$apk")"
+          echo "=== apksigner verify --print-certs ==="
+          echo "$CERT_OUT"
+          # 取第一处 SHA-256 摘要（apksigner 标签形如
+          # "Signer #1 certificate SHA-256 digest: AA:BB:..."）。
+          SIGNER_SHA256="$(echo "$CERT_OUT" | grep -m1 -i 'SHA-256 digest' | sed 's/.*digest:[[:space:]]*//')"
+          if [ -z "$SIGNER_SHA256" ]; then
+            # 兜底：某些版本直接打印裸指纹行
+            SIGNER_SHA256="$(echo "$CERT_OUT" | grep -m1 -oE '([0-9A-F]{2}:){31}[0-9A-F]{2}')"
+          fi
+          echo "signer_sha256=$SIGNER_SHA256"
+          EXPECTED_SIGNER_SHA256="15:32:B4:21:35:16:65:64:EA:C8:DE:F1:8E:AA:89:8D:F6:E7:17:93:70:82:90:F6:84:6F:D6:C2:77:1F:2B:17"
+          if ! echo "$SIGNER_SHA256" | grep -qi "^${EXPECTED_SIGNER_SHA256}$"; then
+            echo "::error::APK 签名证书指纹与固定签名资产不一致。"
+            echo "::error::expected=$EXPECTED_SIGNER_SHA256"
+            echo "::error::actual  =$SIGNER_SHA256"
+            echo "::error::请核对 Secrets 中的 KEYSTORE_BASE64 是否为共用签名资产。"
+            exit 1
+          fi
+          echo "fixed signing certificate fingerprint verified"
 
           # 3) Size gate: a package without the bundled runtime is ~39 MB, far below this.
           apk_bytes="$(stat -c %s "$apk")"

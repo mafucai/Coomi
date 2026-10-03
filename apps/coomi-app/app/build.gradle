@@ -125,13 +125,14 @@ android {
     signingConfigs {
         debug {
             storeFile file('testkey_untrusted.jks')
-            keyAlias 'alias'
-            // 签名口令从 local.properties 读取（不入库）；缺失时明确报错，禁止明文回退。
+            // 签名口令与别名从 local.properties 读取（不入库）；缺失时明确报错，禁止明文回退。
+            // 别名字段 coomi.signing.keyAlias 由 CI 从 Secrets 注入（与 futures-terminal 共用签名）。
             def signingProps = new Properties()
             def signingPropsFile = rootProject.file('local.properties')
             if (signingPropsFile.exists()) {
                 signingPropsFile.withInputStream { signingProps.load(it) }
             }
+            keyAlias signingProps.getProperty('coomi.signing.keyAlias', 'alias')
             storePassword signingProps.getProperty('coomi.signing.storePassword')
             keyPassword signingProps.getProperty('coomi.signing.keyPassword')
             if (!storePassword || !keyPassword) {
