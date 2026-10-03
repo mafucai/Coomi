@@ -224,26 +224,32 @@ jobs:
           # 2) Signature
           "$BUILD_TOOLS/apksigner" verify --verbose "$apk"
 
-          # 2b) 固定签名核对：证书 SHA-256 必须与共用签名资产一致
-          #     （futures-terminal/docs/ANDROID_SIGNING.md 第 1 节）。
+          # 2b) 固定签名核对：证书 SHA-256 必须与签名资产一致
+          #     （docs/ANDROID_SIGNING.md 第 1 节）。
           #     签名不符说明用错了 keystore，会导致已安装用户无法覆盖升级，必须硬失败。
           CERT_OUT="$("$BUILD_TOOLS/apksigner" verify --print-certs "$apk")"
           echo "=== apksigner verify --print-certs ==="
           echo "$CERT_OUT"
-          # 取第一处 SHA-256 摘要（apksigner 标签形如
-          # "Signer #1 certificate SHA-256 digest: AA:BB:..."）。
+          # 取第一处 SHA-256 摘要。apksigner 输出的是无冒号小写十六进制
+          # （形如 "Signer #1 certificate SHA-256 digest: d71b7659..."），
+          # 而 openssl 的指纹是带冒号大写。两边都归一化（去冒号 + 转小写）后再比对，
+          # 否则同一指纹会被判为不一致。
+          normalize_fp() { tr -d ':' <<<"$1" | tr 'A-Z' 'a-z'; }
           SIGNER_SHA256="$(echo "$CERT_OUT" | grep -m1 -i 'SHA-256 digest' | sed 's/.*digest:[[:space:]]*//')"
           if [ -z "$SIGNER_SHA256" ]; then
             # 兜底：某些版本直接打印裸指纹行
-            SIGNER_SHA256="$(echo "$CERT_OUT" | grep -m1 -oE '([0-9A-F]{2}:){31}[0-9A-F]{2}')"
+            SIGNER_SHA256="$(echo "$CERT_OUT" | grep -m1 -oE '([0-9A-Fa-f]{2}:){31}[0-9A-Fa-f]{2}')"
           fi
           echo "signer_sha256=$SIGNER_SHA256"
           EXPECTED_SIGNER_SHA256="D7:1B:76:59:19:8C:E2:91:D7:D9:B8:0E:90:46:FB:60:9E:7D:43:4E:62:18:E7:E4:E0:84:94:7A:40:AC:0A:13"
-          if ! echo "$SIGNER_SHA256" | grep -qi "^${EXPECTED_SIGNER_SHA256}$"; then
+          GOT_FP="$(normalize_fp "$SIGNER_SHA256")"
+          WANT_FP="$(normalize_fp "$EXPECTED_SIGNER_SHA256")"
+          echo "signer_sha256_normalized=$GOT_FP"
+          if [ -z "$GOT_FP" ] || [ "$GOT_FP" != "$WANT_FP" ]; then
             echo "::error::APK 签名证书指纹与固定签名资产不一致。"
-            echo "::error::expected=$EXPECTED_SIGNER_SHA256"
-            echo "::error::actual  =$SIGNER_SHA256"
-            echo "::error::请核对 Secrets 中的 KEYSTORE_BASE64 是否为共用签名资产。"
+            echo "::error::expected=$WANT_FP"
+            echo "::error::actual  =$GOT_FP"
+            echo "::error::请核对 Secrets 中的 KEYSTORE_BASE64 是否为固定签名资产。"
             exit 1
           fi
           echo "fixed signing certificate fingerprint verified"
