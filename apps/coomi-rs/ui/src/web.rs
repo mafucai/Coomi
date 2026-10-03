@@ -8149,6 +8149,7 @@ async fn run_turn(
         })
         // 上下文检查点：任务执行中（用户消息/模型回复/每轮工具后）落盘会话，
         // 意外中断、进程被杀、断线重连后都能从磁盘恢复完整上下文。
+        .with_turn_delivery(&state.home)
         .with_checkpoint({
             let checkpoint_store = SessionStore::new(&state.home);
             Arc::new(move |session: &Session| {

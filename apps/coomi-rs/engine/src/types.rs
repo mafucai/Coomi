@@ -1101,6 +1101,18 @@ pub trait ToolRuntime: Send + Sync {
     async fn lifecycle(&self, _event: &str, _payload: Value) -> Result<Option<String>, String> {
         Ok(None)
     }
+
+    /// V6.4（文档 §3.1）：与 `lifecycle` 同源，但额外回传钩子的结构化回执。
+    /// 用于 `turn_end` 归档后需要拿到 `archive_ack`（含内容哈希/状态）的场景；
+    /// 其余事件沿用只取 `additional_context` 的 `lifecycle`。
+    /// 默认实现返回 `(None, None)`，不改变既有运行时行为。
+    async fn lifecycle_ack(
+        &self,
+        _event: &str,
+        _payload: Value,
+    ) -> Result<(Option<String>, Option<Value>), String> {
+        Ok((None, None))
+    }
 }
 
 #[cfg(test)]

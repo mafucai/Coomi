@@ -4,6 +4,7 @@ mod input_queue;
 mod instructions;
 mod session;
 mod types;
+mod turn_delivery;
 mod workflow_runner;
 mod workflow_store;
 
@@ -18,6 +19,8 @@ pub use context::normalize_history;
 pub use context::retained_user_history;
 pub use context::trim_history_to_fit;
 pub use input_queue::InputQueue;
+pub use turn_delivery::PendingTurn;
+pub use turn_delivery::TurnDeliveryQueue;
 pub use instructions::discover_project_instructions;
 pub use session::Session;
 pub use session::CompactionRecord;

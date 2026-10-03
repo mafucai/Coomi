@@ -1106,6 +1106,7 @@ fn start_agent_turn(
             let agent = Agent::new(system_prompt)
                 .with_input_queue(input_queue)
                 // 上下文检查点：执行中落盘，中断后可从磁盘恢复完整上下文。
+                .with_turn_delivery(&home)
                 .with_checkpoint({
                     let checkpoint_home = home.clone();
                     std::sync::Arc::new(move |session: &Session| {

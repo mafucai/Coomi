@@ -53,3 +53,9 @@ jobs:
       # 硬闸门：cargo test 会先编译整个 engine，编译失败即红。
       - name: Test (engine)
         run: cargo test -p coomi-engine
+
+      # 覆盖闸门：上面的 cargo test 只编译 engine。tools/ui/security 等 crate 的改动
+      # （例如 lifecycle_ack、with_turn_delivery 调用）不在 engine 的依赖图里，
+      # 只跑 -p coomi-engine 会「改了但没编译」却仍然全绿。用 workspace 检查堵住。
+      - name: Check (workspace)
+        run: cargo check --workspace --all-targets

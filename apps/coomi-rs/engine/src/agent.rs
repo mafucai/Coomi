@@ -33,6 +33,13 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
+/// V6.4（文档 §3.1）：工具调用协议失败时的恢复提示文案。
+/// 这类文案是"给用户看的错误提示"，不是真正的最终助手回复；
+/// `turn_end` 必须据此把该轮记为 failed，不得伪装成 success。
+/// 见 docs/V6-ARCHITECTURE.md §3.1「失败、取消、无最终回复时记录 failed/cancelled」。
+pub const RECOVERY_PROTOCOL_FAILURE: &str = "模型返回了不完整的工具调用（缺少函数名），相关工具未执行。请重试；如持续发生，请更换模型或检查供应商的工具调用兼容性。";
+pub const RECOVERY_TOOL_ARGS_INVALID: &str = "工具参数在一次纠正后仍未通过校验，相关工具未执行。请调整请求或补充参数后继续。";
+
 #[derive(Clone, Copy, Debug, Default)]
 struct ToolFailureState {
     executions: u8,
@@ -82,6 +89,7 @@ pub struct Agent {
     /// 上下文检查点回调：任务执行中的关键节点（用户消息、模型回复、每轮
     /// 工具结果）落盘会话，意外中断/重启后仍能从磁盘恢复完整上下文。
     checkpoint: Option<Arc<dyn Fn(&Session) + Send + Sync>>,
+    turn_delivery: Option<Arc<crate::TurnDeliveryQueue>>,
     turn_control: Option<Arc<dyn TurnControl>>,
 }
 
@@ -100,6 +108,7 @@ impl Agent {
             vision_fallback: None,
             reasoning_effort: None,
             checkpoint: None,
+            turn_delivery: None,
             turn_control: None,
         }
     }
@@ -108,6 +117,49 @@ impl Agent {
     pub fn with_checkpoint(mut self, checkpoint: Arc<dyn Fn(&Session) + Send + Sync>) -> Self {
         self.checkpoint = Some(checkpoint);
         self
+    }
+
+    pub fn with_turn_delivery(mut self, engine_home: impl AsRef<std::path::Path>) -> Self {
+        self.turn_delivery = Some(Arc::new(crate::TurnDeliveryQueue::new(engine_home)));
+        self
+    }
+
+    /// Retry durable events in the same session before starting another model turn.
+    /// An unavailable hook leaves the event pending; it never blocks chat.
+    async fn replay_turn_delivery(&self, session: &mut Session, tools: &dyn ToolRuntime) {
+        let Some(queue) = &self.turn_delivery else { return; };
+        let pending = match queue.pending(session.id) {
+            Ok(pending) => pending,
+            Err(_) => {
+                eprintln!("[turn-delivery] pending queue unreadable; not discarded");
+                return;
+            }
+        };
+        for turn in pending {
+            // 三种结果必须分开：钩子报错 / 钩子可用但无回执 / 回执无效。
+            // 混为一谈会把「钩子正常但没给 ack」误报成「归档不可用」，误导排查。
+            match tools.lifecycle_ack("turn_end", turn.delivery_payload()).await {
+                Ok((_, Some(receipt))) => match queue.acknowledge(&turn, &receipt) {
+                    Ok(true) => {}
+                    Ok(false) => eprintln!(
+                        "[turn-delivery] receipt rejected; event retained turn={}",
+                        turn.turn_id
+                    ),
+                    Err(_) => eprintln!(
+                        "[turn-delivery] receipt persistence failed; replay required turn={}",
+                        turn.turn_id
+                    ),
+                },
+                Ok((_, None)) => eprintln!(
+                    "[turn-delivery] hook ran but returned no receipt; event retained turn={}",
+                    turn.turn_id
+                ),
+                Err(error) => eprintln!(
+                    "[turn-delivery] archive unavailable ({error}); event retained turn={}",
+                    turn.turn_id
+                ),
+            }
+        }
     }
 
     pub fn with_turn_control(mut self, control: Arc<dyn TurnControl>) -> Self {
@@ -294,6 +346,7 @@ impl Agent {
         let usage_snapshot = session.usage.clone();
         let usage_before = usage_snapshot.total_tokens();
         let started = Instant::now();
+        self.replay_turn_delivery(session, tools).await;
 
         // V6.1: 只有真实用户轮次才生成稳定 turn_id 与 user_text。
         // internal 轮次（恢复指令、Loop 续跑）不得被当作用户发言归档。
@@ -317,19 +370,21 @@ impl Agent {
         // prompt 被消费前抓取；最终回复 ID 从落盘的 assistant 消息反查。
         let user_message_id = prompt.id.clone();
 
-        let mut result = self
-            .run_turn_message(session, prompt, provider, tools, approval, observer)
+        let mut is_recovery = false;
+        let result = self
+            .run_turn_message(session, prompt, provider, tools, approval, observer, &mut is_recovery)
             .await;
 
         // V6.1: 交付实际展示给用户的最终回复；工具调用中途的草稿与工具输出不算。
-        let status = match &result {
-            Ok(_) => "success",
-            Err(_) => "failed",
-        };
+        // V6.4（文档 §3.1）：工具调用协议失败时引擎返回的是「恢复提示文案」，
+        // 它不是真正的最终助手回复。这类轮次必须记为 failed，且不得推进水位，
+        // 否则会「悄悄将失败算成功」（文档明令禁止）。
         let assistant_text = result.as_deref().unwrap_or("").to_string();
+        let effective_ok = result.is_ok() && !is_recovery && !assistant_text.is_empty();
+        let status = if effective_ok { "success" } else { "failed" };
         // 最终回复 = 会话里最后一条内容与展示回复一致的 assistant 消息；
-        // 失败轮/无最终回复时为空，不拿中间草稿充数。
-        let final_message_id = if result.is_ok() && !assistant_text.is_empty() {
+        // 失败轮/恢复轮/无最终回复时为空，不拿中间草稿充数。
+        let final_message_id = if effective_ok && !assistant_text.is_empty() {
             session
                 .messages
                 .iter()
@@ -343,36 +398,85 @@ impl Agent {
             String::new()
         };
 
-        let lifecycle = tools
-            .lifecycle(
-                "turn_end",
-                serde_json::json!({
-                    "schema_version": 1,
-                    "session_id": session.id,
-                    "turn_id": turn_id,
-                    "is_user_turn": is_user_turn,
-                    "user_text": user_text,
-                    "assistant_text": assistant_text,
-                    "user_message_id": user_message_id,
-                    "final_message_id": final_message_id,
-                    "status": status,
-                    "success": result.is_ok(),
-                    "error": result.as_ref().err().map(ToString::to_string),
-                }),
-            )
-            .await;
-        match lifecycle {
-            Ok(Some(context)) if !context.trim().is_empty() => {
-                session.messages.push(ChatMessage::internal_user(context));
+        let payload = serde_json::json!({
+            "schema_version": 1, "session_id": session.id, "turn_id": turn_id,
+            "is_user_turn": is_user_turn, "user_text": user_text,
+            "assistant_text": if effective_ok { assistant_text.as_str() } else { "" },
+            "user_message_id": user_message_id, "final_message_id": final_message_id,
+            "status": status, "success": effective_ok, "recovery": is_recovery,
+            "error": result.as_ref().err().map(ToString::to_string),
+        });
+        if is_user_turn {
+            if let Some(queue) = &self.turn_delivery {
+                match crate::PendingTurn::new(payload.clone()).and_then(|turn| {
+                    // 去重：同一 turn 重复 run_turn（重试/重启恢复）时 enqueue 幂等。
+                    queue.enqueue(&turn)?;
+                    Ok(turn)
+                }) {
+                    Ok(turn) => {
+                        // 水位在本轮成功完成时推进，与归档回执解耦：
+                        // last_complete_turn 是「会话上下文完整性」水位（供压缩/卸载判断），
+                        // 不是「归档水位」。若绑定 ack，钩子未注册或故障时水位会永久冻结，
+                        // 导致记忆层永远认为不安全、压缩永不发生。
+                        // 归档是否成功由 outbox 的 pending/replay 独立保证（事件保留，不丢弃）。
+                        if effective_ok && !turn_id.is_empty() {
+                            session.last_complete_turn = turn_id.clone();
+                        }
+                        // Enqueue is durable before dispatch. Missing/mismatched ack retains it.
+                        match tools.lifecycle_ack("turn_end", turn.delivery_payload()).await {
+                            Ok((context, receipt)) => {
+                                if let Some(context) = context.filter(|text| !text.trim().is_empty()) {
+                                    session.messages.push(ChatMessage::internal_user(context));
+                                }
+                                match receipt {
+                                    Some(receipt) => match queue.acknowledge(&turn, &receipt) {
+                                        Ok(true) => {}
+                                        Ok(false) => eprintln!(
+                                            "[turn-delivery] receipt rejected; event retained turn={}",
+                                            turn.turn_id
+                                        ),
+                                        Err(_) => eprintln!(
+                                            "[turn-delivery] receipt persistence failed; replay required turn={}",
+                                            turn.turn_id
+                                        ),
+                                    },
+                                    None => eprintln!(
+                                        "[turn-delivery] hook ran but returned no receipt; event retained turn={}",
+                                        turn.turn_id
+                                    ),
+                                }
+                            }
+                            Err(error) => eprintln!(
+                                "[turn-delivery] archive unavailable ({error}); event retained turn={}",
+                                turn.turn_id
+                            ),
+                        }
+                    }
+                    Err(error) => {
+                        // 入队失败 = 没有耐久副本，outbox 的保证不成立。
+                        // 不能静默降级：至少仍要向钩子投递一次（best-effort），
+                        // 否则这一轮会彻底消失，且外部表现与正常轮无异。
+                        eprintln!(
+                            "[turn-delivery] enqueue failed ({error}); falling back to best-effort delivery turn={}",
+                            turn_id
+                        );
+                        if let Ok(Some(context)) = tools.lifecycle("turn_end", payload).await {
+                            if !context.trim().is_empty() {
+                                session.messages.push(ChatMessage::internal_user(context));
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Compatibility for runtimes without an engine-owned outbox.
+                if let Ok(Some(context)) = tools.lifecycle("turn_end", payload).await {
+                    if !context.trim().is_empty() {
+                        session.messages.push(ChatMessage::internal_user(context));
+                    }
+                }
             }
-            Err(error) if result.is_ok() => result = Err(AgentError::Hook(error)),
-            _ => {}
         }
-        // V6.1: 只有真实用户轮次且成功完成后，才推进最后完整轮次水位。
-        // 失败/取消/无最终回复的轮次不推进，供记忆层判断卸载安全边界。
-        if result.is_ok() && is_user_turn && !turn_id.is_empty() {
-            session.last_complete_turn = turn_id;
-        }
+        self.run_checkpoint(session);
         update_loop_accounting(
             session,
             usage_before,
@@ -397,6 +501,7 @@ impl Agent {
         tools: &dyn ToolRuntime,
         approval: &dyn ApprovalHandler,
         observer: &dyn AgentObserver,
+        recovery: &mut bool,
     ) -> Result<String, AgentError> {
         if !session.hooks_started {
             if let Some(context) = tools
@@ -630,9 +735,9 @@ impl Agent {
                         observer.on_event(&AgentEvent::ToolFinished { call, result });
                     }
                     let recovery_message = if protocol_failure {
-                        "模型返回了不完整的工具调用（缺少函数名），相关工具未执行。请重试；如持续发生，请更换模型或检查供应商的工具调用兼容性。"
+                        RECOVERY_PROTOCOL_FAILURE
                     } else {
-                        "工具参数在一次纠正后仍未通过校验，相关工具未执行。请调整请求或补充参数后继续。"
+                        RECOVERY_TOOL_ARGS_INVALID
                     };
                     observer.on_event(&AgentEvent::Text(recovery_message.into()));
                     session
@@ -640,6 +745,7 @@ impl Agent {
                         .push(ChatMessage::assistant(recovery_message, Vec::new()));
                     self.run_checkpoint(session);
                     session.touch();
+                    *recovery = true;
                     return Ok(recovery_message.into());
                 }
                 invalid_tool_retry_used = true;

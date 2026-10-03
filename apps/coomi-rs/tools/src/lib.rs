@@ -2670,6 +2670,40 @@ impl ToolRuntime for CoreTools {
         }
         Ok((!outcome.additional_context.trim().is_empty()).then_some(outcome.additional_context))
     }
+
+    /// V6.4：与 `lifecycle` 相同的事件映射和 allow 语义，但额外把钩子的
+    /// `result`（结构化回执，如 archive_ack）一并返回。
+    async fn lifecycle_ack(
+        &self,
+        event: &str,
+        payload: Value,
+    ) -> Result<(Option<String>, Option<Value>), String> {
+        let Some(hooks) = &self.hooks else {
+            return Ok((None, None));
+        };
+        let event = match event {
+            "session_start" => HookEvent::SessionStart,
+            "turn_start" => HookEvent::TurnStart,
+            "turn_end" => HookEvent::TurnEnd,
+            "compaction_prepare" => HookEvent::CompactionPrepare,
+            "compaction_end" => HookEvent::CompactionEnd,
+            other => return Err(format!("unknown hook lifecycle event: {other}")),
+        };
+        let outcome = hooks
+            .run(event, None, payload)
+            .await
+            .map_err(|error| format!("{error:#}"))?;
+        if !outcome.allow {
+            return Err(if outcome.reason.is_empty() {
+                format!("{event:?} hook denied execution")
+            } else {
+                outcome.reason
+            });
+        }
+        let context = (!outcome.additional_context.trim().is_empty())
+            .then_some(outcome.additional_context);
+        Ok((context, outcome.result))
+    }
 }
 
 const fn default_memory_scope() -> MemoryScope {
