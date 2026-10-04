@@ -734,6 +734,19 @@ impl Agent {
                         observer.on_event(&AgentEvent::ToolStarted(call.clone()));
                         observer.on_event(&AgentEvent::ToolFinished { call, result });
                     }
+                    // 【2026-10-04 修复】模型本轮可能既产出正常文本、又附带
+                    // 无效工具调用（例如缺少函数名）。无效调用已在上面被丢弃，
+                    // 但不能因此丢弃模型已产出的有效文本——否则 effective_ok
+                    // 恒为 false，记忆层永远拿不到 assistant_text（V6 归档助手侧
+                    // 恒为空、不抽卡、检查点空壳）。
+                    // 仅当本轮没有任何有效文本时，才按原逻辑判为恢复轮。
+                    if !response_content.trim().is_empty() {
+                        if self.accept_queued_input(session, observer) {
+                            continue;
+                        }
+                        session.touch();
+                        return Ok(response_content);
+                    }
                     let recovery_message = if protocol_failure {
                         RECOVERY_PROTOCOL_FAILURE
                     } else {
