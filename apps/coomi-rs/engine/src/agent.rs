@@ -126,7 +126,13 @@ impl Agent {
 
     /// Retry durable events in the same session before starting another model turn.
     /// An unavailable hook leaves the event pending; it never blocks chat.
+    ///
+    /// 2026-10-04：加重放上限。必然失败的轮次（如 recovery-turn）永远拿不到 ack，
+    /// 原「无上限重放全部 pending」会让队列无限膨胀并拖慢首 token（T11 已知项）。
+    /// 现在：同一 turn 累计重放超过 MAX_REPLAY_ATTEMPTS 次后移入 permanently-failed/，
+    /// 队列不再重放它；数据保留、可追溯，且日志明示。
     async fn replay_turn_delivery(&self, session: &mut Session, tools: &dyn ToolRuntime) {
+        const MAX_REPLAY_ATTEMPTS: u32 = 3;
         let Some(queue) = &self.turn_delivery else { return; };
         let pending = match queue.pending(session.id) {
             Ok(pending) => pending,
@@ -136,11 +142,33 @@ impl Agent {
             }
         };
         for turn in pending {
+            // 计数先行：无论本轮结果如何，都算作一次尝试。
+            let attempt = match queue.note_attempt(&turn) {
+                Ok(n) => n,
+                Err(_) => 1, // 计数失败时保守放行，不因计数问题丢事件
+            };
+            if attempt > MAX_REPLAY_ATTEMPTS {
+                match queue.retire(&turn) {
+                    Ok(()) => eprintln!(
+                        "[turn-delivery] replay limit reached ({} attempts); moved to permanently-failed turn={}",
+                        attempt - 1,
+                        turn.turn_id
+                    ),
+                    Err(error) => eprintln!(
+                        "[turn-delivery] replay limit reached but retire failed ({error}); event retained turn={}",
+                        turn.turn_id
+                    ),
+                }
+                continue;
+            }
             // 三种结果必须分开：钩子报错 / 钩子可用但无回执 / 回执无效。
             // 混为一谈会把「钩子正常但没给 ack」误报成「归档不可用」，误导排查。
             match tools.lifecycle_ack("turn_end", turn.delivery_payload()).await {
                 Ok((_, Some(receipt))) => match queue.acknowledge(&turn, &receipt) {
-                    Ok(true) => {}
+                    Ok(true) => {
+                        // 成功归档：清除重试计数，该轮不再需要重放。
+                        let _ = queue.clear_attempts(&turn);
+                    }
                     Ok(false) => eprintln!(
                         "[turn-delivery] receipt rejected; event retained turn={}",
                         turn.turn_id
