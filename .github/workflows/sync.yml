@@ -1,10 +1,19 @@
 name: Sync GitHub to Gitee
 
+# 2026-10-03 停用：主人主线在 GitHub，Gitee 同步无需求；
+# 且仓库未配置 GITEE_SSH_PRIVATE_KEY，每次 push 必挂。
+# 恢复方法：把下面 on: 的 push/workflow_dispatch 注释解开，并在仓库
+# Secrets 里配置 GITEE_SSH_PRIVATE_KEY（公钥加到 gitee.com/tensorhub/coomi 部署密钥）。
 on:
-  push:
-    branches: ["**"]
-    tags: ["**"]
+  # push:
+  #   branches: ["**"]
+  #   tags: ["**"]
   workflow_dispatch:
+    inputs:
+      confirm:
+        description: '确认要手动同步到 Gitee（默认停用）'
+        required: true
+        default: 'no'
 
 permissions:
   contents: read
