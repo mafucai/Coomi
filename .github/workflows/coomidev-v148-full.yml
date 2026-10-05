@@ -172,12 +172,31 @@ jobs:
             exit 1
           fi
 
-          # 1) 解码固定 keystore 到 Gradle 期望的资产路径
+          # 1) 解码 keystore 到临时 P12 文件
           rm -f apps/coomi-app/app/testkey_untrusted.jks
-          echo -n "${KEYSTORE_B64}" | base64 -d > apps/coomi-app/app/testkey_untrusted.jks
+          echo -n "${KEYSTORE_B64}" | base64 -d > /tmp/coomi-keystore.p12
+          test -s /tmp/coomi-keystore.p12
+
+          # 2) 自动检测格式：P12 → 转换为 JKS；JKS → 直接使用
+          keytool -list -keystore /tmp/coomi-keystore.p12 -storetype PKCS12 -storepass "${KEYSTORE_PASS}" -v | grep -q "Alias" && {
+            echo "检测到 P12 keystore，转换为 JKS..."
+            keytool -importkeystore \
+              -srckeystore /tmp/coomi-keystore.p12 \
+              -srcstoretype PKCS12 \
+              -srcstorepass "${KEYSTORE_PASS}" \
+              -destkeystore apps/coomi-app/app/testkey_untrusted.jks \
+              -deststoretype JKS \
+              -deststorepass "${KEYSTORE_PASS}" \
+              -destkeypass "${KEY_PASS:-${KEYSTORE_PASS}}" \
+              -alias "${KEYSTORE_ALIAS_NAME}" || {
+              echo "P12 转换失败，尝试直接作为 JKS 使用..."
+              cp /tmp/coomi-keystore.p12 apps/coomi-app/app/testkey_untrusted.jks
+            }
+          }
+
           test -s apps/coomi-app/app/testkey_untrusted.jks
 
-          # 2) 口令与别名写入 local.properties（该文件已被 .gitignore 排除，不入库）
+          # 3) 口令与别名写入 local.properties（该文件已被 .gitignore 排除，不入库）
           {
             echo "sdk.dir=${ANDROID_SDK_ROOT}"
             echo "coomi.signing.storePassword=${KEYSTORE_PASS}"
@@ -185,7 +204,7 @@ jobs:
             echo "coomi.signing.keyAlias=${KEYSTORE_ALIAS_NAME}"
           } > local.properties
 
-          # 3) 立即核对 keystore 内的别名与证书指纹，早失败、不猜
+          # 4) 核对 keystore 内的别名与证书指纹，早失败、不猜
           echo "=== keystore 别名清单 ==="
           keytool -list -keystore apps/coomi-app/app/testkey_untrusted.jks \
             -storepass "${KEYSTORE_PASS}" | sed -n '1,40p'
