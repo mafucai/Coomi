@@ -296,6 +296,22 @@ pub fn compacted_history(messages: &[ChatMessage], summary: &str) -> Vec<ChatMes
 
     // 结构：早期目标 → 摘要 → 最近完整会话轮次。
     let mut output = retained;
+
+    // V6.4: 保留来自 compaction_end 钩子的 additional_context 总结
+    // (标记为 internal + compaction_summary)。这些消息包含 V6 渐进式记忆
+    // 的 AI 总结，必须在多轮压缩中生存下来——仅依靠 LLM 生成的 summary
+    // 字符串是不够的（会被下一轮压缩覆盖）。
+    //
+    // 过滤条件：role==User, compaction_summary==true, internal==true
+    // （排除普通 compaction_summary，因为它们已经被 compacted_history
+    // 丢弃并替换为当前 summary；只保留 internal 标记的额外上下文）。
+    for message in messages
+        .iter()
+        .filter(|m| m.role == Role::User && m.compaction_summary && m.internal)
+    {
+        output.push(message.clone());
+    }
+
     output.push(ChatMessage::summary(format!("{SUMMARY_PREFIX}\n{summary}")));
     output.extend(recent_messages);
     output

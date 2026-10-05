@@ -891,7 +891,10 @@ impl Agent {
                 if let Some(context) = result.additional_context
                     && !context.trim().is_empty()
                 {
-                    session.messages.push(ChatMessage::internal_user(context));
+                    // V6.4: additional_context (e.g. AI summary from compaction_end) must survive
+                    // future compaction cycles. Mark as memory_block (internal + compaction_summary)
+                    // so compacted_history preserves it across multiple compaction rounds.
+                    session.messages.push(ChatMessage::memory_block(context));
                 }
                 if result.success {
                     tool_failures.remove(&fingerprint);
@@ -1049,6 +1052,15 @@ impl Agent {
             .context
             .window_id
             .map_or_else(String::new, |id| id.to_string());
+        // V6.4: 记录本次压缩保留的 AI 总结消息 ID
+        let preserved_memory_blocks: Vec<String> = session
+            .messages
+            .iter()
+            .filter(|m| m.role == crate::Role::User && m.compaction_summary && m.internal)
+            .map(|m| m.id.clone())
+            .filter(|id| !id.is_empty())
+            .collect();
+
         session.compaction_log.push(CompactionRecord {
             compacted_at: Utc::now().to_rfc3339(),
             automatic,
@@ -1057,6 +1069,7 @@ impl Agent {
             before_tokens,
             after_tokens: status.used_tokens,
             dropped_message_ids,
+            preserved_memory_blocks,
         });
         // V6.3: 仅在压缩成功、V6.2 记录已落盘后发核验事件；携带实际移出的
         // 消息 ID，供记忆层按 message_id → turn_id → 原文 核验/回载。

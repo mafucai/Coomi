@@ -192,6 +192,14 @@ impl ChatMessage {
         message
     }
 
+    /// V6.4: AI 总结消息（来自 compaction_end 钩子的 additional_context）
+    /// 标记为 internal + compaction_summary，确保在多轮压缩中生存下去。
+    pub fn memory_block(content: impl Into<String>) -> Self {
+        let mut message = Self::summary(content);
+        message.internal = true;
+        message
+    }
+
     pub fn provider_item(item: Value) -> Self {
         let mut message = Self::assistant(String::new(), Vec::new());
         message.compaction_summary = true;

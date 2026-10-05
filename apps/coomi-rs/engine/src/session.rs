@@ -98,6 +98,10 @@ pub struct CompactionRecord {
     /// 被移出活跃模型历史的消息 ID（精确列表，按原顺序）。
     /// 保留在活跃历史中的消息不在此列。
     pub dropped_message_ids: Vec<String>,
+    /// V6.4: 本次压缩保留的 AI 总结消息 ID（internal + compaction_summary），
+    /// 供记忆层追踪这些总结在压缩后仍活跃。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub preserved_memory_blocks: Vec<String>,
 }
 
 impl Session {
@@ -1018,6 +1022,7 @@ mod tests {
             before_tokens: 180_000,
             after_tokens: 30_000,
             dropped_message_ids: vec!["m1".to_owned(), "m2".to_owned()],
+            preserved_memory_blocks: Vec::new(),
         });
         store.save(&session).expect("save session");
 
@@ -1065,6 +1070,7 @@ mod tests {
             before_tokens: 1,
             after_tokens: 2,
             dropped_message_ids: Vec::new(),
+            preserved_memory_blocks: Vec::new(),
         });
         session.clear_data();
         assert!(session.compaction_log.is_empty());
