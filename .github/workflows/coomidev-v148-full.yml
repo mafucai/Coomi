@@ -329,13 +329,16 @@ jobs:
           tag_name: ${{ inputs.release_tag || 'coomidev-v1.4.8-full' }}
           name: "CoomiDev v1.4.8 (full runtime)"
           body: |
-            CoomiDev preview built from `${{ inputs.ref || github.ref_name }}` (run ${{ github.run_id }}).
+            CoomiDev build from `${{ inputs.ref || github.ref_name }}` (run ${{ github.run_id }}).
 
             - Package: `com.coomidev.android` (installs alongside the official Coomi)
             - Application label: `CoomiDev`
             - Default engine port: `18765`
             - Bundles the official Runtime V2 environment (proot host + Ubuntu 24.04 ARM64 rootfs)
-            - Signed with a per-run preview keystore; uninstall an earlier preview if Android rejects an update
+            - Signed with the **fixed release keystore**; signing certificate SHA-256
+              `D7:1B:76:59:19:8C:E2:91:D7:D9:B8:0E:90:46:FB:60:9E:7D:43:4E:62:18:E7:E4:E0:84:94:7A:40:AC:0A:13`
+              (verified by the build before publish). This APK overwrites-installs earlier
+              fixed-signed builds; only a build signed with a *different* key would require uninstalling first.
           files: |
             dist/CoomiDev-v1.4.8-full.apk
             dist/CoomiDev-v1.4.8-full.apk.sha256
