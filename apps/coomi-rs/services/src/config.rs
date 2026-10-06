@@ -168,6 +168,9 @@ pub struct ProviderSettings {
     pub effective_context_window_percent: Option<u8>,
     #[serde(default)]
     pub auto_compact_token_limit: Option<u64>,
+    /// V6-DESIGN §4-E5：压缩后用户原文保留预算（token）。不填则用引擎默认 20,000。
+    #[serde(default)]
+    pub memory_context_max_tokens: Option<u64>,
     #[serde(default)]
     pub auto_compact_scope: coomi_engine::AutoCompactScope,
     #[serde(default)]
@@ -260,6 +263,7 @@ impl ProviderRegistry {
                     .unwrap_or(95)
                     .clamp(1, 100),
                 auto_compact_token_limit: provider.auto_compact_token_limit,
+                memory_context_max_tokens: provider.memory_context_max_tokens,
                 auto_compact_scope: provider.auto_compact_scope,
                 comp_hash: provider.comp_hash,
                 max_output_tokens: provider.max_output_tokens.unwrap_or(8_192),
@@ -491,6 +495,7 @@ impl Default for ProviderSettings {
             model_context_windows: BTreeMap::new(),
             effective_context_window_percent: None,
             auto_compact_token_limit: None,
+            memory_context_max_tokens: None,
             auto_compact_scope: coomi_engine::AutoCompactScope::Total,
             comp_hash: None,
             max_output_tokens: None,

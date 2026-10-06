@@ -13,6 +13,11 @@ pub struct ModelCapabilities {
     pub effective_context_window_percent: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_compact_token_limit: Option<u64>,
+    /// V6-DESIGN §4-E5：压缩后用户原文的保留预算（token）。
+    /// `None` 时回退到 `context::COMPACT_USER_MESSAGE_MAX_TOKENS`（兼容旧行为）。
+    /// 调低它即让「30 轮前的旧用户原文」不再无条件永留。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_context_max_tokens: Option<u64>,
     #[serde(default)]
     pub auto_compact_scope: AutoCompactScope,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -37,6 +42,7 @@ impl Default for ModelCapabilities {
             context_window: default_context_window(),
             effective_context_window_percent: default_effective_context_window_percent(),
             auto_compact_token_limit: None,
+            memory_context_max_tokens: None,
             auto_compact_scope: AutoCompactScope::Total,
             comp_hash: None,
             max_output_tokens: default_max_output_tokens(),
@@ -69,6 +75,14 @@ impl ModelCapabilities {
         self.auto_compact_token_limit
             .map_or(derived, |limit| limit.min(derived))
             .min(self.effective_context_window())
+    }
+
+    /// V6-DESIGN §4-E5：压缩后用户原文保留预算。
+    /// 未配置时回退到 `context::COMPACT_USER_MESSAGE_MAX_TOKENS`（20,000），
+    /// 保持旧行为不变。
+    pub fn memory_context_max_tokens(&self) -> u64 {
+        self.memory_context_max_tokens
+            .unwrap_or(crate::context::COMPACT_USER_MESSAGE_MAX_TOKENS)
     }
 }
 
@@ -109,6 +123,11 @@ pub struct ChatMessage {
     pub compaction_summary: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub internal: bool,
+    /// 渐进式记忆（V6-DESIGN §4-E1）：由记忆槽每轮重建的常驻记忆块。
+    /// 与 `compaction_summary`（LLM 交接摘要）/ `internal`（内部注入）同级，
+    /// 是独立标记：压缩时按此保留，重建时按此清理，互不混淆。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub memory: bool,
     /// 数字生命体主动消息（气泡/开场问候）：由生命体队列直接写入，不来自模型。
     #[serde(default, skip_serializing_if = "is_false")]
     pub life_proactive: bool,
@@ -144,6 +163,7 @@ impl ChatMessage {
             tool_call_id: None,
             compaction_summary: false,
             internal: false,
+            memory: false,
             life_proactive: false,
             provider_items: Vec::new(),
             images: Vec::new(),
@@ -159,6 +179,7 @@ impl ChatMessage {
             tool_call_id: Some(call_id.into()),
             compaction_summary: false,
             internal: false,
+            memory: false,
             life_proactive: false,
             provider_items: Vec::new(),
             images: Vec::new(),
@@ -174,6 +195,7 @@ impl ChatMessage {
             tool_call_id: None,
             compaction_summary: false,
             internal: false,
+            memory: false,
             life_proactive: false,
             provider_items: Vec::new(),
             images: Vec::new(),
@@ -192,11 +214,14 @@ impl ChatMessage {
         message
     }
 
-    /// V6.4: AI 总结消息（来自 compaction_end 钩子的 additional_context）
-    /// 标记为 internal + compaction_summary，确保在多轮压缩中生存下去。
+    /// V6.4: AI 总结消息（来自 compaction_end 钩子的 additional_context）。
+    /// V6-DESIGN §4-E1：打独立 `memory` 标记，并与 `internal` + `compaction_summary`
+    /// 并存——`memory` 是 V6 记忆槽的权威标记（压缩保留 / 每轮重建都只看它），
+    /// 另两者保留是为了兼容既有压缩/展示逻辑。
     pub fn memory_block(content: impl Into<String>) -> Self {
         let mut message = Self::summary(content);
         message.internal = true;
+        message.memory = true;
         message
     }
 

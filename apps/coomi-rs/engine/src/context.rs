@@ -11,7 +11,9 @@ use std::collections::HashSet;
 use uuid::Uuid;
 
 const BASELINE_TOKENS: u64 = 12_000;
-const COMPACT_USER_MESSAGE_MAX_TOKENS: u64 = 20_000;
+/// 压缩后用户原文保留预算（token）——默认值。
+/// V6-DESIGN §4-E5：可被 `ModelCapabilities::memory_context_max_tokens` 覆盖。
+pub const COMPACT_USER_MESSAGE_MAX_TOKENS: u64 = 20_000;
 // 压缩后保留最近三轮的真实用户指令、每轮最终助手回复，以及工作现场尾部。
 // 消息数与正文预算均有上限，避免单次长 Agent 任务压缩后仍塞回完整工具瀑布流。
 const COMPACT_RECENT_USER_MESSAGES: usize = 3;
@@ -221,6 +223,17 @@ pub fn estimate_request_tokens(
 }
 
 pub fn compacted_history(messages: &[ChatMessage], summary: &str) -> Vec<ChatMessage> {
+    compacted_history_with_budget(messages, summary, COMPACT_USER_MESSAGE_MAX_TOKENS)
+}
+
+/// V6-DESIGN §4-E4：同 `compacted_history`，但用户原文保留预算由调用方传入
+/// （默认 20,000 = 永不触顶 ⇒ 原文永留）。传入较小值即可让旧用户原文被裁掉，
+/// 把上下文让给记忆槽与近期轮次。
+pub fn compacted_history_with_budget(
+    messages: &[ChatMessage],
+    summary: &str,
+    user_budget: u64,
+) -> Vec<ChatMessage> {
     let user_positions: Vec<usize> = messages
         .iter()
         .enumerate()
@@ -235,7 +248,7 @@ pub fn compacted_history(messages: &[ChatMessage], summary: &str) -> Vec<ChatMes
 
     // 早期用户消息：新者优先占用预算，超预算时从更早的消息开始丢弃/截断。
     let mut retained = Vec::new();
-    let mut budget = COMPACT_USER_MESSAGE_MAX_TOKENS;
+    let mut budget = user_budget;
     for position in older.iter().rev() {
         if budget == 0 {
             break;
@@ -294,27 +307,46 @@ pub fn compacted_history(messages: &[ChatMessage], summary: &str) -> Vec<ChatMes
     }
     let recent_messages = bounded_recent_history(&recent_messages);
 
-    // 结构：早期目标 → 摘要 → 最近完整会话轮次。
+    // 结构：早期目标 → 摘要 → 记忆槽 → 最近完整会话轮次。
     let mut output = retained;
+    output.push(ChatMessage::summary(format!("{SUMMARY_PREFIX}\n{summary}")));
 
-    // V6.4: 保留来自 compaction_end 钩子的 additional_context 总结
-    // (标记为 internal + compaction_summary)。这些消息包含 V6 渐进式记忆
-    // 的 AI 总结，必须在多轮压缩中生存下来——仅依靠 LLM 生成的 summary
-    // 字符串是不够的（会被下一轮压缩覆盖）。
-    //
-    // 过滤条件：role==User, compaction_summary==true, internal==true
-    // （排除普通 compaction_summary，因为它们已经被 compacted_history
-    // 丢弃并替换为当前 summary；只保留 internal 标记的额外上下文）。
-    for message in messages
-        .iter()
-        .filter(|m| m.role == Role::User && m.compaction_summary && m.internal)
-    {
+    // V6.4 / V6-DESIGN §4-E3: 保留记忆槽（memory 标记）的常驻总结，
+    // 让它在多轮压缩中生存下来。判定用独立的 `memory` 标记，不再借用
+    // `compaction_summary && internal`——后者会与 LLM 交接摘要混淆。
+    // 放在 LLM 交接摘要之后、最近轮次之前：既贴近尾部（利于供应商前缀缓存），
+    // 又不打断最近对话的连贯性。
+    for message in messages.iter().filter(|m| m.memory) {
         output.push(message.clone());
     }
 
-    output.push(ChatMessage::summary(format!("{SUMMARY_PREFIX}\n{summary}")));
     output.extend(recent_messages);
     output
+}
+
+/// V6-DESIGN §4-E2：移除会话中所有记忆槽消息（上一轮重建遗留）。
+/// 返回被移除的条数，供调用方诊断。记忆槽每轮由钩子重建一次，
+/// 不做累积——旧块必须先清掉，否则会随轮次无限膨胀、挤占上下文。
+pub fn strip_memory_blocks(messages: &mut Vec<ChatMessage>) -> usize {
+    let before = messages.len();
+    messages.retain(|message| !message.memory);
+    before - messages.len()
+}
+
+/// V6-DESIGN §4-E2：把本轮记忆块插入「最新真实用户消息之前」，置尾。
+/// 若会话中尚无真实用户消息，则追加到队尾。
+/// 真实用户消息 = role==User 且非 internal、非 compaction_summary、非 memory。
+pub fn place_memory_block(messages: &mut Vec<ChatMessage>, block: ChatMessage) {
+    let insert_at = messages
+        .iter()
+        .rposition(|message| {
+            message.role == Role::User
+                && !message.internal
+                && !message.compaction_summary
+                && !message.memory
+        })
+        .unwrap_or(messages.len());
+    messages.insert(insert_at, block);
 }
 
 /// Keep the recent transcript chronological while bounding long single-turn tool waterfalls.
@@ -706,5 +738,122 @@ mod tests {
         assert_eq!(state.compaction_count, 1);
         assert_eq!(state.first_window_id, state.previous_window_id);
         assert_ne!(state.previous_window_id, state.window_id);
+    }
+
+    // ── V6-DESIGN §7 验收：E1–E4 ──────────────────────────────
+
+    // §7-1 常驻不被压缩吞：记忆块在压缩后仍在，且排在摘要之前供模型持续看到。
+    #[test]
+    fn compaction_preserves_memory_block() {
+        let messages = vec![
+            ChatMessage::user("goal"),
+            ChatMessage::memory_block("AI 总结：第1-30轮要点"),
+            ChatMessage::assistant("answer", Vec::new()),
+            ChatMessage::user("latest"),
+        ];
+        let compacted = compacted_history(&messages, "new summary");
+        assert!(
+            compacted.iter().any(|m| m.memory && m.content.contains("第1-30轮")),
+            "memory block must survive compaction"
+        );
+    }
+
+    // §7-1 连续多次压缩，记忆块仍不丢（模拟 3 次 compact）。
+    #[test]
+    fn memory_block_survives_repeated_compaction() {
+        let mut messages = vec![
+            ChatMessage::user("goal"),
+            ChatMessage::memory_block("常驻总结A"),
+            ChatMessage::user("second"),
+            ChatMessage::memory_block("常驻总结B"),
+            ChatMessage::user("third"),
+        ];
+        for round in 0..3 {
+            messages = compacted_history(&messages, &format!("summary-{round}"));
+            assert!(
+                messages.iter().any(|m| m.memory && m.content.contains("常驻总结A")),
+                "block A lost at round {round}"
+            );
+            assert!(
+                messages.iter().any(|m| m.memory && m.content.contains("常驻总结B")),
+                "block B lost at round {round}"
+            );
+        }
+    }
+
+    // E1：memory_block 打独立标记，且不与 LLM 交接摘要混淆。
+    #[test]
+    fn memory_block_carries_distinct_flag() {
+        let block = ChatMessage::memory_block("x");
+        assert!(block.memory);
+        assert!(block.internal);
+        assert!(block.compaction_summary);
+        let plain_summary = ChatMessage::summary("x");
+        assert!(!plain_summary.memory, "LLM summary must not be a memory block");
+    }
+
+    // E2：每轮重建先清掉上一轮记忆块，不累积。
+    #[test]
+    fn strip_memory_blocks_removes_only_memory() {
+        let mut messages = vec![
+            ChatMessage::user("keep-me"),
+            ChatMessage::memory_block("old block 1"),
+            ChatMessage::memory_block("old block 2"),
+            ChatMessage::summary("llm summary"),
+            ChatMessage::assistant("kept", Vec::new()),
+        ];
+        let removed = strip_memory_blocks(&mut messages);
+        assert_eq!(removed, 2);
+        assert!(!messages.iter().any(|m| m.memory));
+        assert!(messages.iter().any(|m| m.content == "keep-me"));
+        assert!(messages.iter().any(|m| m.compaction_summary && !m.memory));
+    }
+
+    // E2：记忆块置尾——插在最新真实用户消息之前，而非队尾。
+    #[test]
+    fn place_memory_block_inserts_before_latest_user() {
+        let mut messages = vec![
+            ChatMessage::user("first"),
+            ChatMessage::assistant("a1", Vec::new()),
+            ChatMessage::user("latest"),
+        ];
+        place_memory_block(&mut messages, ChatMessage::memory_block("MEM"));
+        let mem_pos = messages.iter().position(|m| m.memory).unwrap();
+        let last_user = messages.iter().rposition(|m| m.role == Role::User && !m.internal).unwrap();
+        assert!(mem_pos < last_user, "memory block must precede the newest real user message");
+        assert_eq!(messages[last_user].content, "latest");
+    }
+
+    // E4：预算可调——调低后早期用户原文被丢弃，不再无条件永留。
+    #[test]
+    fn compacted_history_respects_budget_override() {
+        let big = "这段是早期用户原文，用来验证预算覆盖后会被截断。".repeat(1_500);
+        let messages = vec![
+            ChatMessage::user(big.clone()),
+            ChatMessage::user("mid"),
+            ChatMessage::user("recent-1"),
+            ChatMessage::user("recent-2"),
+            ChatMessage::user("recent-3"),
+        ];
+        let compacted = compacted_history_with_budget(&messages, "summary", 100);
+        // 最近 3 轮保留；最早的超大用户原文按 100 token 预算被截断
+        let early = compacted
+            .iter()
+            .find(|m| m.content.contains("[earlier content truncated]"))
+            .expect("the earliest oversized user message should be truncated, not kept whole");
+        assert!(estimate_text_tokens(&early.content) <= 100);
+    }
+
+    // E5：默认（未配置）保持 20,000 旧行为，配置后生效。
+    #[test]
+    fn memory_context_max_tokens_defaults_and_overrides() {
+        let default_caps = ModelCapabilities::default();
+        assert_eq!(
+            default_caps.memory_context_max_tokens(),
+            COMPACT_USER_MESSAGE_MAX_TOKENS
+        );
+        let mut caps = ModelCapabilities::default();
+        caps.memory_context_max_tokens = Some(6_000);
+        assert_eq!(caps.memory_context_max_tokens(), 6_000);
     }
 }

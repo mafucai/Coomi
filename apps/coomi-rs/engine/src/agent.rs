@@ -15,8 +15,10 @@ use crate::ToolCall;
 use crate::ToolResult;
 use crate::ToolRuntime;
 use crate::TurnControl;
-use crate::compacted_history;
+use crate::compacted_history_with_budget;
 use crate::normalize_history;
+use crate::place_memory_block;
+use crate::strip_memory_blocks;
 use crate::CompactionRecord;
 use chrono::Utc;
 use crate::trim_history_to_fit;
@@ -545,7 +547,9 @@ impl Agent {
             }
             session.hooks_started = true;
         }
-        if let Some(context) = tools
+        // V6-DESIGN §4-E2：记忆槽每轮重建。先取出本轮召回内容，再清掉上一轮
+        // 遗留的记忆块（不累积），最后把本轮块置尾（插在最新真实用户消息之前）。
+        let turn_start_context = tools
             .lifecycle(
                 "turn_start",
                 serde_json::json!({
@@ -556,11 +560,12 @@ impl Agent {
             )
             .await
             .map_err(AgentError::Hook)?
-            .filter(|context| !context.trim().is_empty())
-        {
-            session.messages.push(ChatMessage::internal_user(context));
-        }
+            .filter(|context| !context.trim().is_empty());
+        strip_memory_blocks(&mut session.messages);
         session.messages.push(prompt);
+        if let Some(context) = turn_start_context {
+            place_memory_block(&mut session.messages, ChatMessage::memory_block(context));
+        }
         self.run_checkpoint(session);
         let tool_specs = tools.specs();
         let capabilities = provider.capabilities();
@@ -891,10 +896,12 @@ impl Agent {
                 if let Some(context) = result.additional_context
                     && !context.trim().is_empty()
                 {
-                    // V6.4: additional_context (e.g. AI summary from compaction_end) must survive
-                    // future compaction cycles. Mark as memory_block (internal + compaction_summary)
-                    // so compacted_history preserves it across multiple compaction rounds.
-                    session.messages.push(ChatMessage::memory_block(context));
+                    // V6-DESIGN §4-E2/E3：工具侧 additional_context 也作为记忆块置尾，
+                    // 打 memory 标记以便压缩保留与下轮重建清理。
+                    place_memory_block(
+                        &mut session.messages,
+                        ChatMessage::memory_block(context),
+                    );
                 }
                 if result.success {
                     tool_failures.remove(&fingerprint);
@@ -1024,7 +1031,11 @@ impl Agent {
                 }
             };
             (
-                compacted_history(&sanitized_source, response.content.trim()),
+                compacted_history_with_budget(
+                    &sanitized_source,
+                    response.content.trim(),
+                    capabilities.memory_context_max_tokens(),
+                ),
                 response.usage,
             )
         };
@@ -1052,11 +1063,11 @@ impl Agent {
             .context
             .window_id
             .map_or_else(String::new, |id| id.to_string());
-        // V6.4: 记录本次压缩保留的 AI 总结消息 ID
+        // V6.4: 记录本次压缩保留的 AI 总结消息 ID（memory 标记）
         let preserved_memory_blocks: Vec<String> = session
             .messages
             .iter()
-            .filter(|m| m.role == crate::Role::User && m.compaction_summary && m.internal)
+            .filter(|m| m.memory)
             .map(|m| m.id.clone())
             .filter(|id| !id.is_empty())
             .collect();
@@ -1075,7 +1086,10 @@ impl Agent {
         // 消息 ID，供记忆层按 message_id → turn_id → 原文 核验/回载。
         // 钩子失败不回滚记录也不阻断（事件是只读核验，V6.2 记录是事实源）。
         let record = session.compaction_log.last().expect("record just pushed");
-        let _ = tools
+        // V6-DESIGN §5-M2：compaction_end 钩子可回传 additional_context（30 轮触发提示）。
+        // 必须接收并注入，否则「引擎提醒 AI 该写总结」这条链路断裂——AI 永远收不到提示，
+        // V6 会话库的 semantic_summary 恒为 0。
+        if let Ok(Some(context)) = tools
             .lifecycle(
                 "compaction_end",
                 serde_json::json!({
@@ -1089,7 +1103,14 @@ impl Agent {
                     "dropped_message_ids": record.dropped_message_ids,
                 }),
             )
-            .await;
+            .await
+            && !context.trim().is_empty()
+        {
+            place_memory_block(
+                &mut session.messages,
+                ChatMessage::memory_block(context),
+            );
+        }
         observer.on_event(&AgentEvent::CompactionCompleted {
             automatic,
             before_tokens,
