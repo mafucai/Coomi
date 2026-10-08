@@ -378,10 +378,13 @@ impl Agent {
         let started = Instant::now();
         self.replay_turn_delivery(session, tools).await;
 
+        // V6.5（B 修法）：每轮开始清空插话累积，避免上一轮 drain 到的插话
+        // 串进本轮的归档内容。internal 轮次也要清（其本身不归档）。
+        session.queued_turn_input.clear();
         // V6.1: 只有真实用户轮次才生成稳定 turn_id 与 user_text。
         // internal 轮次（恢复指令、Loop 续跑）不得被当作用户发言归档。
         let is_user_turn = !prompt.internal;
-        let user_text = if is_user_turn {
+        let mut user_text = if is_user_turn {
             prompt.content.clone()
         } else {
             String::new()
@@ -405,6 +408,20 @@ impl Agent {
             .run_turn_message(session, prompt, provider, tools, approval, observer, &mut is_recovery)
             .await;
 
+        // V6.5（B 修法）：把本轮运行期接走的插话（jump_in）并入归档 user_text。
+        // 插话在 run_turn_message 内部才被 accept_queued_input drain，归档组装点
+        // 此前看不到它，导致「模型收到了、归档层却没有」——原文永久不可召回。
+        // 这些插话语义上属于本轮：并入后不新增 raw_turn 记录，轮数计数不变。
+        if is_user_turn && !session.queued_turn_input.is_empty() {
+            for extra in &session.queued_turn_input {
+                let extra = extra.trim();
+                if !extra.is_empty() {
+                    user_text.push('\n');
+                    user_text.push_str(extra);
+                }
+            }
+            session.queued_turn_input.clear();
+        }
         // V6.1: 交付实际展示给用户的最终回复；工具调用中途的草稿与工具输出不算。
         // V6.4（文档 §3.1）：工具调用协议失败时引擎返回的是「恢复提示文案」，
         // 它不是真正的最终助手回复。这类轮次必须记为 failed，且不得推进水位，
@@ -1131,6 +1148,12 @@ impl Agent {
         session
             .messages
             .extend(messages.iter().cloned().map(ChatMessage::user));
+        // V6.5（B 修法）：记下本轮运行期被接走的插话原文。
+        // 插话在此刻才 drain，归档组装点（run_accounted_turn）此前看不到它；
+        // 这里累积，归档时并入本轮 user_text，避免原文在归档层丢失。
+        session
+            .queued_turn_input
+            .extend(messages.iter().cloned());
         observer.on_event(&AgentEvent::QueuedInputAccepted(messages));
         true
     }
@@ -1586,6 +1609,90 @@ mod tests {
             .await
             .expect("queued turn");
         assert_eq!(output, "done");
+    }
+
+    /// V6.5（B 修法）回归：运行期接走的插话（jump_in）必须并入本轮 turn_end
+    /// 的 user_text，否则归档层丢原文、模型收到过却永久不可召回。
+    struct MergedQueuedProvider;
+
+    #[async_trait]
+    impl ModelProvider for MergedQueuedProvider {
+        fn provider_id(&self) -> &str {
+            "mock"
+        }
+
+        fn model(&self) -> &str {
+            "merged-queued"
+        }
+
+        async fn complete(&self, _request: ModelRequest) -> Result<ModelResponse> {
+            Ok(ModelResponse {
+                content: "done".into(),
+                ..Default::default()
+            })
+        }
+    }
+
+    struct CapturingLifecycleTool {
+        turn_end_payloads: Mutex<Vec<serde_json::Value>>,
+    }
+
+    #[async_trait]
+    impl ToolRuntime for CapturingLifecycleTool {
+        fn specs(&self) -> Vec<ToolSpec> {
+            Vec::new()
+        }
+
+        async fn call(&self, _call: &ToolCall, _approval: &dyn ApprovalHandler) -> ToolResult {
+            ToolResult::success("noop")
+        }
+
+        async fn lifecycle(
+            &self,
+            event: &str,
+            payload: serde_json::Value,
+        ) -> Result<Option<String>, String> {
+            if event == "turn_end" {
+                self.turn_end_payloads
+                    .lock()
+                    .expect("lock payloads")
+                    .push(payload);
+            }
+            Ok(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_input_is_merged_into_turn_end_user_text() {
+        let queue = Arc::new(InputQueue::default());
+        queue.push("版本不兼容，归家异途，装了秒退".into());
+        let tools = CapturingLifecycleTool {
+            turn_end_payloads: Mutex::new(Vec::new()),
+        };
+        let mut session = Session::new("mock", "queued", PathBuf::from("."));
+        Agent::new("test")
+            .with_input_queue(queue)
+            .run_turn(
+                &mut session,
+                "start",
+                &MergedQueuedProvider,
+                &tools,
+                &Approve,
+                &NoopObserver,
+            )
+            .await
+            .expect("queued turn");
+        let payloads = tools.turn_end_payloads.lock().expect("lock payloads");
+        let payload = payloads.last().expect("turn_end emitted");
+        let user_text = payload["user_text"].as_str().unwrap_or_default();
+        assert!(
+            user_text.contains("start"),
+            "missing trigger prompt: {user_text}"
+        );
+        assert!(
+            user_text.contains("归家异途"),
+            "queued jump-in text was not merged into user_text: {user_text}"
+        );
     }
 
     struct CompactingProvider {

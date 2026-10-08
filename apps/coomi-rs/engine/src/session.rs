@@ -78,6 +78,12 @@ pub struct Session {
     /// 「被移出活跃历史的原文去哪找」。只做记录，不阻断压缩。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub compaction_log: Vec<CompactionRecord>,
+    /// V6.5（B 修法）：本轮运行期被 `accept_queued_input` 接走的插话原文。
+    /// 插话在 `run_turn_message` 内部才被 drain，此刻才可见；归档时并入本轮
+    /// `user_text`，避免插话在归档层丢失（原文不可召回）。
+    /// 运行期字段：不落盘，每轮 run_turn 开头清空。
+    #[serde(skip)]
+    pub queued_turn_input: Vec<String>,
 }
 
 /// V6.2: 一次压缩的卸载记录。
@@ -129,6 +135,7 @@ impl Session {
             current_turn_id: String::new(),
             last_complete_turn: String::new(),
             compaction_log: Vec::new(),
+            queued_turn_input: Vec::new(),
         }
     }
 
